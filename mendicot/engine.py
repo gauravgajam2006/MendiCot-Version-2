@@ -190,7 +190,10 @@ class MendiCotEngine:
 
         self.state.trump_state.status = TrumpStatus.HIDDEN
 
-        self.state.current_turn = self._get_next_player(hider_id)
+        self.state.current_turn = (
+            self.state.selected_first_player_id
+            or self._get_next_player(hider_id)
+        )
 
         self.state.phase = GamePhase.PLAYING
         self.state.version += 1
