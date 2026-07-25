@@ -81,3 +81,61 @@ def test_game_phase_validation(engine, four_players):
     engine.create_game("game1", four_players)
     with pytest.raises(InvalidPhase):
         engine.play_card("P1", Card(Suit.HEARTS, 3))
+
+def test_highest_trump_wins_trick(game_state_4p, engine):
+    game_state_4p.hands["P1"] = [
+        Card(Suit.HEARTS, 3)
+    ]
+    game_state_4p.hands["P2"] = [
+        Card(Suit.SPADES, 10)
+    ]
+    game_state_4p.hands["P3"] = [
+        Card(Suit.SPADES, 14)
+    ]
+    game_state_4p.hands["P4"] = [
+        Card(Suit.HEARTS, 14)
+    ]
+
+    game_state_4p.trump_state.suit = Suit.SPADES
+    game_state_4p.trump_state.status = TrumpStatus.PUBLIC
+
+    engine.play_card("P1", Card(Suit.HEARTS, 3))
+    engine.play_card("P2", Card(Suit.SPADES, 10))
+    engine.play_card("P3", Card(Suit.SPADES, 14))
+    engine.play_card("P4", Card(Suit.HEARTS, 14))
+
+    engine.resolve_trick()
+
+    assert (
+        game_state_4p.completed_tricks[0].winner_player_id
+        == "P3"
+    )
+
+def test_trump_beats_higher_lead_suit_card(game_state_4p, engine):
+    game_state_4p.hands["P1"] = [
+        Card(Suit.HEARTS, 3)
+    ]
+    game_state_4p.hands["P2"] = [
+        Card(Suit.HEARTS, 14)
+    ]
+    game_state_4p.hands["P3"] = [
+        Card(Suit.SPADES, 3)
+    ]
+    game_state_4p.hands["P4"] = [
+        Card(Suit.HEARTS, 13)
+    ]
+
+    game_state_4p.trump_state.suit = Suit.SPADES
+    game_state_4p.trump_state.status = TrumpStatus.PUBLIC
+
+    engine.play_card("P1", Card(Suit.HEARTS, 3))
+    engine.play_card("P2", Card(Suit.HEARTS, 14))
+    engine.play_card("P3", Card(Suit.SPADES, 3))
+    engine.play_card("P4", Card(Suit.HEARTS, 13))
+
+    engine.resolve_trick()
+
+    assert (
+        game_state_4p.completed_tricks[0].winner_player_id
+        == "P3"
+    )

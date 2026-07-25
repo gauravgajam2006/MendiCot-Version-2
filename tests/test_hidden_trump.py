@@ -247,3 +247,110 @@ def test_hidden_trump_does_not_reveal_when_player_has_no_trump(
         game_state_hidden_4p.trump_state.status
         == TrumpStatus.HIDDEN
     )
+
+def test_full_hidden_trump_game_4_players(four_players, engine):
+    engine.create_game(
+        "hidden_full_game",
+        four_players,
+        hidden_trump_mode=True
+    )
+
+    state = engine.deal_cards()
+
+    assert state.phase == GamePhase.HIDDEN_TRUMP_SELECTION
+
+    engine.select_trump_hider("P1")
+
+    selected_card = state.hands["P1"][0]
+    expected_suit = selected_card.suit
+
+    engine.select_hidden_card("P1", 0)
+
+    assert state.phase == GamePhase.HIDDEN_TRUMP_REVEAL
+    assert state.trump_state.suit == expected_suit
+
+    engine.complete_hidden_trump_setup()
+
+    assert state.phase == GamePhase.PLAYING
+    assert state.trump_state.status == TrumpStatus.HIDDEN
+
+    from mendicot.validators import validate_follow_suit
+    from mendicot.exceptions import MustFollowSuit, MustPlayTrump
+
+    while state.phase in (
+        GamePhase.PLAYING,
+        GamePhase.TRICK_RESOLUTION
+    ):
+        if state.phase == GamePhase.TRICK_RESOLUTION:
+            engine.resolve_trick()
+        else:
+            player_id = state.current_turn
+            hand = state.hands[player_id]
+            trick = state.current_trick
+
+            valid_card = None
+
+            if not trick.played_cards:
+                valid_card = hand[0]
+            else:
+                    for card in hand:
+                        try:
+                            validate_follow_suit(
+                                hand,
+                                trick.lead_suit,
+                                card,
+                                state.trump_state
+                            )
+                            valid_card = card
+                            break
+                        except (MustFollowSuit, MustPlayTrump):
+                            continue
+
+                # Hidden trump may become public during play_card().
+                # If the selected card is not a trump card on a cut,
+                # choose a trump card before playing.
+            if (
+                    valid_card is not None
+                    and state.trump_state.status == TrumpStatus.HIDDEN
+                    and trick.played_cards
+                ):
+                    is_on_cut = not any(
+                        c.suit == trick.lead_suit
+                        for c in hand
+                    )
+
+                    if is_on_cut:
+                        has_trump = any(
+                            c.suit == state.trump_state.suit
+                            for c in hand
+                        )
+
+                        if (
+                            has_trump
+                            and valid_card.suit != state.trump_state.suit
+                        ):
+                            valid_card = next(
+                                c for c in hand
+                                if c.suit == state.trump_state.suit
+                            )
+
+            engine.play_card(player_id, valid_card)
+
+    assert state.phase in (
+        GamePhase.GAME_OVER,
+        GamePhase.DRAW
+    )
+
+    total_tricks = (
+        state.teams["TeamA"].tricks_won
+        + state.teams["TeamB"].tricks_won
+    )
+
+    assert total_tricks == 12
+
+    total_tens = (
+        state.teams["TeamA"].tens_captured
+        + state.teams["TeamB"].tens_captured
+    )
+
+    assert total_tens == 4
