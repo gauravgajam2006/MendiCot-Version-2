@@ -46,10 +46,23 @@ def engine(rng):
 
 @pytest.fixture
 def game_state_4p(engine, four_players):
-    engine.create_game("game1", four_players, hidden_trump_mode=False)
+    engine.create_game(
+    "game1",
+    four_players,
+    host_id=four_players[0].player_id,
+    hidden_trump_mode=False
+)
     return engine.deal_cards()
 
 @pytest.fixture
 def game_state_hidden_4p(engine, four_players):
-    engine.create_game("game2", four_players, hidden_trump_mode=True)
+    engine.create_game(
+        "game2",
+        four_players,
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True
+    )
+
+    engine.select_trump_hider("P1", "P1")
+
     return engine.deal_cards()

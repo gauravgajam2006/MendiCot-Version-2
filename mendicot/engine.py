@@ -18,16 +18,17 @@ from .validators import (
     validate_card_ownership
 )
 
+
 class MendiCotEngine:
     """Core game engine for MendiCot card game.
-    
+
     Manages game state and enforces all game rules through a phase-based
     state machine. Supports both normal and hidden trump modes.
     """
 
     def __init__(self, rng: random.Random | None = None):
         """Initialize the engine.
-        
+
         Args:
             rng: Optional random.Random instance for deterministic testing.
                  If None, uses SystemRandom for secure shuffling.
@@ -35,22 +36,15 @@ class MendiCotEngine:
         self.rng = rng
         self.state: GameState | None = None
 
-    def create_game(self, game_id: str, players: list[Player], hidden_trump_mode: bool = False) -> GameState:
-        """Create a new game with validated players and seating.
-        
-        Args:
-            game_id: Unique identifier for this game.
-            players: List of Player objects with valid team and seat assignments.
-            hidden_trump_mode: If True, uses hidden trump selection flow.
-            
-        Returns:
-            The initialized GameState in CREATED phase.
-            
-        Raises:
-            InvalidPlayerCount: If player count is not 4, 6, or 8.
-            InvalidTeamConfiguration: If teams are not exactly 2 equal-sized teams.
-            InvalidSeatArrangement: If same-team players sit adjacent.
-        """
+    def create_game(
+        self,
+        game_id: str,
+        players: list[Player],
+        host_id: str,
+        hidden_trump_mode: bool = False
+    ) -> GameState:
+        """Create a new game with validated players and seating."""
+
         player_count = len(players)
         validate_player_count(player_count)
         validate_team_configuration(players)
@@ -72,16 +66,70 @@ class MendiCotEngine:
             teams=teams,
             seat_order=seat_order,
             hands={},
+            host_id=host_id,
             phase=GamePhase.CREATED,
             hidden_trump_mode=hidden_trump_mode
         )
+
+        return self.state
+
+    def select_trump_hider(
+        self,
+        actor_id_or_player_id: str,
+        player_id: str | None = None
+    ) -> GameState:
+        """Select the player who will hide the trump.
+
+        Two calling conventions:
+        - select_trump_hider(actor_id, player_id): Host authorization required.
+        - select_trump_hider(player_id): During HIDDEN_TRUMP_SELECTION phase.
+        """
+        if player_id is not None:
+            # Host authorization version
+            actor_id = actor_id_or_player_id
+            if actor_id != self.state.host_id:
+                raise PermissionError(
+                    "Only the host can select the trump hider."
+                )
+            if player_id not in self.state.seat_order:
+                raise ValueError("Player not in game.")
+            self.state.selected_trump_hider_id = player_id
+            self.state.trump_state.trump_hider_id = player_id
+        else:
+            # In-phase designation
+            target_player_id = actor_id_or_player_id
+            if self.state.phase != GamePhase.HIDDEN_TRUMP_SELECTION:
+                raise InvalidPhase(
+                    "Can only select trump hider in HIDDEN_TRUMP_SELECTION phase."
+                )
+            if target_player_id not in self.state.seat_order:
+                raise ValueError("Player not in game.")
+            self.state.trump_state.trump_hider_id = target_player_id
+
+        self.state.version += 1
+        return self.state
+
+    def select_first_player(
+        self,
+        actor_id: str,
+        player_id: str
+    ) -> GameState:
+        """Host selects the first player to lead."""
+        if actor_id != self.state.host_id:
+            raise PermissionError(
+                "Only the host can select the first player."
+            )
+        if player_id not in self.state.seat_order:
+            raise ValueError("Player not in game.")
+        self.state.selected_first_player_id = player_id
+        self.state.version += 1
         return self.state
 
     def deal_cards(self) -> GameState:
         """Shuffle and deal cards to all players.
-        
+
         Transitions from CREATED to PLAYING (normal) or HIDDEN_TRUMP_SELECTION (hidden).
-        
+
         Raises:
             InvalidPhase: If not in CREATED phase.
         """
@@ -99,28 +147,11 @@ class MendiCotEngine:
             self.state.phase = GamePhase.HIDDEN_TRUMP_SELECTION
         else:
             self.state.phase = GamePhase.PLAYING
-            self.state.current_turn = self.state.seat_order[0]
+            self.state.current_turn = (
+                self.state.selected_first_player_id
+                or self.state.seat_order[0]
+            )
 
-        self.state.version += 1
-        return self.state
-
-    def select_trump_hider(self, player_id: str) -> GameState:
-        """Designate a player as the trump hider.
-        
-        Args:
-            player_id: ID of the player who will select the hidden trump card.
-            
-        Raises:
-            InvalidPhase: If not in HIDDEN_TRUMP_SELECTION phase.
-            ValueError: If player is not in the game.
-        """
-        if self.state.phase != GamePhase.HIDDEN_TRUMP_SELECTION:
-            raise InvalidPhase("Can only select trump hider in HIDDEN_TRUMP_SELECTION phase.")
-        
-        if player_id not in self.state.seat_order:
-            raise ValueError("Player not in game.")
-
-        self.state.trump_state.trump_hider_id = player_id
         self.state.version += 1
         return self.state
 
@@ -155,9 +186,6 @@ class MendiCotEngine:
         if self.state.phase != GamePhase.HIDDEN_TRUMP_REVEAL:
             raise InvalidPhase()
 
-        if self.state.phase != GamePhase.HIDDEN_TRUMP_REVEAL:
-            raise InvalidPhase()
-
         hider_id = self.state.trump_state.trump_hider_id
 
         self.state.trump_state.status = TrumpStatus.HIDDEN
@@ -169,17 +197,6 @@ class MendiCotEngine:
 
         return self.state
 
-        self.state.trump_state.status = TrumpStatus.HIDDEN
-
-        self.state.current_turn = self._get_next_player(hider_id)
-
-        self.state.phase = GamePhase.PLAYING
-        self.state.version += 1
-
-        return self.state
-
-
-     
     def play_card(self, player_id: str, card: Card) -> GameState:
         """Play a card in the current trick."""
 
@@ -251,13 +268,13 @@ class MendiCotEngine:
 
     def reveal_trump(self, player_id: str) -> GameState:
         """Reveal the hidden trump suit (separate action from playing a card).
-        
+
         Can only be called when the player is on cut (has no lead-suit cards).
         After this call, the player must still play a card via play_card().
-        
+
         Args:
             player_id: The player choosing to reveal trump.
-            
+
         Raises:
             InvalidPhase: If not in PLAYING phase.
             NotPlayersTurn: If it's not this player's turn.
@@ -268,7 +285,7 @@ class MendiCotEngine:
             raise InvalidPhase()
         if player_id != self.state.current_turn:
             raise NotPlayersTurn()
-        
+
         trick = self.state.current_trick
         if not trick.played_cards or trick.lead_suit is None:
             raise InvalidTrumpAction("Cannot reveal trump on first card of trick.")
@@ -285,10 +302,10 @@ class MendiCotEngine:
 
     def resolve_trick(self) -> GameState:
         """Resolve the current completed trick.
-        
+
         Determines the winner, awards captured cards and tens,
         and transitions to the next trick or end-of-game.
-        
+
         Raises:
             InvalidPhase: If not in TRICK_RESOLUTION phase.
         """
@@ -328,7 +345,7 @@ class MendiCotEngine:
 
     def calculate_score(self) -> dict[str, dict]:
         """Return current scoring information for all teams.
-        
+
         Returns:
             Dict mapping team_id to {'tens_captured': int, 'tricks_won': int}.
         """
@@ -342,9 +359,9 @@ class MendiCotEngine:
 
     def determine_winner(self) -> str | None:
         """Determine the winning team based on scoring rules.
-        
+
         Compares tens captured first, then tricks won as tiebreaker.
-        
+
         Returns:
             Winning team_id, or None if the result is a DRAW.
         """
@@ -353,10 +370,10 @@ class MendiCotEngine:
 
         if t1.tens_captured != t2.tens_captured:
             return t1.team_id if t1.tens_captured > t2.tens_captured else t2.team_id
-        
+
         if t1.tricks_won != t2.tricks_won:
             return t1.team_id if t1.tricks_won > t2.tricks_won else t2.team_id
-            
+
         return None
 
     def _determine_trick_winner(self, trick: Trick, trump_state: TrumpState) -> str:
@@ -368,7 +385,7 @@ class MendiCotEngine:
 
         for pc in trick.played_cards[1:]:
             card = pc.card
-            
+
             if trump_suit is not None:
                 if best_card.suit == trump_suit:
                     if card.suit == trump_suit and card.rank > best_card.rank:
@@ -420,7 +437,7 @@ class MendiCotEngine:
 
         elif trump_status != TrumpStatus.PUBLIC:
             # Hide the hidden card from the player's view.
-         state_dict["trump_state"]["hidden_rank"] = None
-         state_dict["trump_state"]["hidden_card_index"] = None
+            state_dict["trump_state"]["hidden_rank"] = None
+            state_dict["trump_state"]["hidden_card_index"] = None
 
-        return state_dict 
+        return state_dict

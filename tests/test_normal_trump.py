@@ -66,7 +66,11 @@ def test_cannot_create_game_with_3_players(engine):
         Player("P3", "TeamA", 2)
     ]
     with pytest.raises(InvalidPlayerCount):
-        engine.create_game("game1", players)
+        engine.create_game(
+    "game1",
+    players,
+    host_id=players[0].player_id
+)
 
 def test_wrong_player_turn_rejected(game_state_4p, engine):
     with pytest.raises(NotPlayersTurn):
@@ -78,6 +82,10 @@ def test_card_not_in_hand_rejected(game_state_4p, engine):
         engine.play_card("P1", card_not_owned)
 
 def test_game_phase_validation(engine, four_players):
-    engine.create_game("game1", four_players)
+    engine.create_game(
+    "game1",
+    four_players,
+    host_id=four_players[0].player_id
+)
     with pytest.raises(InvalidPhase):
         engine.play_card("P1", Card(Suit.HEARTS, 3))

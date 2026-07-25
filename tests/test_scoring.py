@@ -39,7 +39,12 @@ def test_trick_count_increments(game_state_4p, engine):
     assert scores["TeamA"]["tricks_won"] == 0
 
 def test_full_game_4_players(four_players, engine):
-    engine.create_game("full_game", four_players, hidden_trump_mode=False)
+    engine.create_game(
+    "full_game",
+    four_players,
+    host_id=four_players[0].player_id,
+    hidden_trump_mode=False
+)
     state = engine.deal_cards()
     
     from mendicot.validators import validate_follow_suit

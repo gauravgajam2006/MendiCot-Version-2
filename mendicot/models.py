@@ -59,7 +59,7 @@ class TrumpState:
     suit: Suit | None = None
     hidden_rank: Rank | None = None
     hidden_card_index: int | None = None
-    trump_hider_id: str | None = None
+    trump_hider_id: str | None = None   
 
 @dataclass
 class GameState:
@@ -69,6 +69,10 @@ class GameState:
     teams: dict[str, Team]
     seat_order: list[str]
     hands: dict[str, list[Card]]
+    host_id: str | None = None
+    selected_trump_hider_id: str | None = None
+    selected_first_player_id: str | None = None
+
     phase: GamePhase = GamePhase.CREATED
     current_turn: str | None = None
     current_trick: Trick = field(default_factory=Trick)
