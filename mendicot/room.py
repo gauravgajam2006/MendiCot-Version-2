@@ -115,3 +115,16 @@ class GameRoom:
         )
         
         self._status = RoomStatus.IN_GAME
+
+    def get_state(self) -> dict:
+        return {
+            "room_id": self.room_id,
+            "status": self._status.value,
+            "host_id": self.host_id,
+            "players": [
+                {
+                    "player_id": p.player_id,
+                    "display_name": p.display_name
+                } for p in self._players
+            ]
+        }
