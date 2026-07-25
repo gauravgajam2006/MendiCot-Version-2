@@ -434,12 +434,13 @@ class MendiCotEngine:
 
         trump_status = self.state.trump_state.status
 
-        if self.state.phase == GamePhase.HIDDEN_TRUMP_REVEAL:
-            # During temporary reveal, hidden card information is visible.
+        is_hider = (player_id == self.state.trump_state.trump_hider_id)
+        if self.state.phase == GamePhase.HIDDEN_TRUMP_REVEAL and is_hider:
+            # During temporary reveal, hidden card information is visible only to the hider.
             pass
-
         elif trump_status != TrumpStatus.PUBLIC:
             # Hide the hidden card from the player's view.
+            state_dict["trump_state"]["suit"] = None
             state_dict["trump_state"]["hidden_rank"] = None
             state_dict["trump_state"]["hidden_card_index"] = None
 
