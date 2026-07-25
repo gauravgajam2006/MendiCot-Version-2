@@ -13,10 +13,21 @@ from .exceptions import (
     InvalidTrumpAction,
     GameAlreadyFinished,
     InvalidSeatArrangement,
-    MustPlayTrump
+    MustPlayTrump,
+    RoomError,
+    RoomAlreadyExists,
+    RoomNotFound,
+    DuplicatePlayer,
+    RoomFull,
+    GameAlreadyStarted,
+    InvalidRoomSize,
+    NotRoomHost,
+    PlayerNotInRoom,
 )
 from .deck import create_deck, shuffle_deck, deal_cards
 from .engine import MendiCotEngine
+from .room import GameRoom, RoomPlayer, RoomStatus
+from .room_manager import RoomManager
 
 __all__ = [
     "Suit", "Rank", "GamePhase", "TrumpStatus", "ActionType",
@@ -25,6 +36,10 @@ __all__ = [
     "NotPlayersTurn", "CardNotOwned", "MustFollowSuit", "InvalidHiddenCardSelection",
     "TrumpAlreadyRevealed", "InvalidTrumpAction", "GameAlreadyFinished",
     "InvalidSeatArrangement", "MustPlayTrump",
+    "RoomError", "RoomAlreadyExists", "RoomNotFound", "DuplicatePlayer",
+    "RoomFull", "GameAlreadyStarted", "InvalidRoomSize", "NotRoomHost", "PlayerNotInRoom",
     "create_deck", "shuffle_deck", "deal_cards",
-    "MendiCotEngine"
+    "MendiCotEngine",
+    "GameRoom", "RoomPlayer", "RoomStatus",
+    "RoomManager"
 ]

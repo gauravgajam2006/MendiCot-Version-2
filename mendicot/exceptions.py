@@ -49,3 +49,30 @@ class InvalidSeatArrangement(MendiCotError):
 class MustPlayTrump(MendiCotError):
     def __init__(self, message="Player must play a trump card."):
         super().__init__(message)
+
+class RoomError(MendiCotError):
+    """Base exception for room management errors."""
+
+class RoomAlreadyExists(RoomError):
+    """Raised when creating a room with a duplicate ID."""
+
+class RoomNotFound(RoomError):
+    """Raised when a requested room does not exist."""
+
+class DuplicatePlayer(RoomError):
+    """Raised when a player with the same ID is already in the room."""
+
+class RoomFull(RoomError):
+    """Raised when the room has reached maximum capacity (8)."""
+
+class GameAlreadyStarted(RoomError):
+    """Raised when an action is invalid because the game has started."""
+
+class InvalidRoomSize(RoomError):
+    """Raised when trying to start with an invalid player count."""
+
+class NotRoomHost(RoomError):
+    """Raised when a non-host attempts a host-only action."""
+
+class PlayerNotInRoom(RoomError):
+    """Raised when referencing a player not in the room."""
