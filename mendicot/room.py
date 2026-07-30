@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .engine import MendiCotEngine
+from .room_ids import normalize_room_id
 from .models import Player
 from .exceptions import (
     DuplicatePlayer,
@@ -31,8 +32,15 @@ class GameRoom:
     MAX_PLAYERS = 8
     VALID_START_COUNTS = (4, 6, 8)
 
-    def __init__(self, room_id: str):
-        self.room_id = room_id
+    def __init__(
+        self,
+        room_id: str,
+        configured_player_count: int = MAX_PLAYERS,
+        trump_mode: str = "normal",
+    ):
+        self.room_id = normalize_room_id(room_id)
+        self.configured_player_count = configured_player_count
+        self.trump_mode = trump_mode
         self.host_id: Optional[str] = None
         self._players: list[RoomPlayer] = []
         self._status = RoomStatus.WAITING
@@ -57,8 +65,10 @@ class GameRoom:
         if player_id in self.player_ids:
             raise DuplicatePlayer(f"Player {player_id} is already in the room.")
         
-        if self.player_count >= self.MAX_PLAYERS:
-            raise RoomFull(f"Room has reached maximum capacity ({self.MAX_PLAYERS}).")
+        if self.player_count >= self.configured_player_count:
+            raise RoomFull(
+                f"Room has reached configured capacity ({self.configured_player_count})."
+            )
 
         player = RoomPlayer(
             player_id=player_id, 
@@ -85,7 +95,7 @@ class GameRoom:
             else:
                 self.host_id = None
 
-    def start_game(self, requester_id: str, hidden_trump_mode: bool = False) -> None:
+    def start_game(self, requester_id: str) -> None:
         if requester_id != self.host_id:
             raise NotRoomHost("Only the room host can start the game.")
         
@@ -111,7 +121,7 @@ class GameRoom:
             game_id=self.room_id,
             players=engine_players,
             host_id=self.host_id,
-            hidden_trump_mode=hidden_trump_mode
+            hidden_trump_mode=self.trump_mode == "hidden"
         )
         
         self._status = RoomStatus.IN_GAME
@@ -121,6 +131,8 @@ class GameRoom:
             "room_id": self.room_id,
             "status": self._status.value,
             "host_id": self.host_id,
+            "player_count": self.configured_player_count,
+            "trump_mode": self.trump_mode,
             "players": [
                 {
                     "player_id": p.player_id,

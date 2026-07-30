@@ -1,18 +1,29 @@
+import asyncio
+import os
 import uuid
 from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 
 from mendicot.room_manager import RoomManager
 from mendicot.room import RoomStatus
 from mendicot.enums import GamePhase, Suit
 from mendicot.models import Card
 from mendicot.exceptions import MendiCotError
+from mendicot.room_ids import normalize_room_id
 
 from .connection_manager import ConnectionManager
-from .schemas import JoinRoomRequest, JoinRoomResponse, CreateRoomResponse
+from .schemas import CreateRoomRequest, JoinRoomRequest, JoinRoomResponse, CreateRoomResponse
 
 app = FastAPI(title="MendiCot API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global State
 room_manager = RoomManager()
@@ -20,15 +31,126 @@ connection_manager = ConnectionManager()
 
 # session_token -> {"room_id": str, "player_id": str}
 session_tokens: Dict[str, Dict[str, str]] = {}
+# Offline players retain their lobby seat and credential during this interval.
+# Tests may monkeypatch this value to avoid waiting for the production default.
+DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS = float(
+    os.getenv("MENDICOT_DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", "10")
+)
+_disconnect_cleanup_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+
+
+def invalidate_player_tokens(room_id: str, player_id: str) -> None:
+    """Invalidate every session token for one player in one room."""
+    room_id = normalize_room_id(room_id)
+    for token, session in list(session_tokens.items()):
+        if session["room_id"] == room_id and session["player_id"] == player_id:
+            del session_tokens[token]
+
+
+def invalidate_room_tokens(room_id: str) -> None:
+    """Invalidate every session token belonging to a room."""
+    room_id = normalize_room_id(room_id)
+    for token, session in list(session_tokens.items()):
+        if session["room_id"] == room_id:
+            del session_tokens[token]
+
+
+def _cancel_disconnect_cleanup(room_id: str, player_id: str) -> None:
+    """Cancel a pending offline-player cleanup, if any."""
+    key = (normalize_room_id(room_id), player_id)
+    task = _disconnect_cleanup_tasks.pop(key, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _cancel_room_disconnect_cleanups(room_id: str) -> None:
+    room_id = normalize_room_id(room_id)
+    for key in [key for key in _disconnect_cleanup_tasks if key[0] == room_id]:
+        _cancel_disconnect_cleanup(*key)
+
+
+def _next_host_id(room, excluded_player_id: str) -> str | None:
+    """Return the lowest-seat online player other than the departing player."""
+    candidates = [p.player_id for p in room._players if p.player_id != excluded_player_id]
+    online = connection_manager.get_connected_player_ids(room.room_id)
+    return next((player_id for player_id in candidates if player_id in online), None)
+
+
+async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except MendiCotError:
+        return False
+    if room.status != RoomStatus.WAITING or player_id not in room.player_ids:
+        return False
+    removing_host = room.host_id == player_id
+    next_host_id = _next_host_id(room, player_id) if removing_host else None
+    room_manager.leave_room(room_id, player_id)
+    if removing_host:
+        room.host_id = next_host_id
+    invalidate_player_tokens(room_id, player_id)
+    if room.player_count == 0:
+        _cancel_room_disconnect_cleanups(room_id)
+        invalidate_room_tokens(room_id)
+        connection_manager.clear_room(room_id)
+        room_manager.delete_room(room_id)
+        return True
+    await _broadcast_room_state(room_id)
+    return True
+
+
+def _schedule_disconnect_cleanup(room_id: str, player_id: str) -> None:
+    """Schedule one task-identity-guarded removal for an offline lobby player."""
+    room_id = normalize_room_id(room_id)
+    key = (room_id, player_id)
+    _cancel_disconnect_cleanup(room_id, player_id)
+
+    async def expire() -> None:
+        try:
+            await asyncio.sleep(DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS)
+            if _disconnect_cleanup_tasks.get(key) is not asyncio.current_task():
+                return
+            if connection_manager.get_connection(room_id, player_id) is not None:
+                return
+            await _remove_lobby_player(room_id, player_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _disconnect_cleanup_tasks.get(key) is asyncio.current_task():
+                _disconnect_cleanup_tasks.pop(key, None)
+
+    _disconnect_cleanup_tasks[key] = asyncio.create_task(expire())
+
+
+async def _handle_socket_disconnect(
+    room_id: str, player_id: str, websocket: WebSocket
+) -> None:
+    """Mark only the currently registered socket offline and start its grace period."""
+    if not connection_manager.disconnect(room_id, player_id, websocket):
+        return
+    try:
+        room = room_manager.get_room(room_id)
+        _schedule_disconnect_cleanup(room_id, player_id)
+        await _broadcast_room_state(room_id)
+        if room.status == RoomStatus.IN_GAME:
+            await connection_manager.broadcast(
+                room_id,
+                {"type": "PLAYER_OFFLINE", "payload": {"player_id": player_id}},
+            )
+    except MendiCotError:
+        pass
+
 
 @app.post("/api/rooms", response_model=CreateRoomResponse)
-async def create_room():
-    room_id = str(uuid.uuid4())[:8]
-    room_manager.create_room(room_id)
+async def create_room(request: CreateRoomRequest):
+    room_id = normalize_room_id(str(uuid.uuid4())[:8])
+    room_manager.create_room(room_id, request.player_count, request.trump_mode)
     return CreateRoomResponse(room_id=room_id)
 
 @app.post("/api/rooms/{room_id}/join", response_model=JoinRoomResponse)
 async def join_room(room_id: str, request: JoinRoomRequest):
+    room_id = normalize_room_id(room_id)
     try:
         room_manager.join_room(room_id, request.player_id, request.display_name)
     except MendiCotError as e:
@@ -47,6 +169,7 @@ async def join_room(room_id: str, request: JoinRoomRequest):
     )
 
 def _get_room_state(room_id: str) -> dict:
+    room_id = normalize_room_id(room_id)
     room = room_manager.get_room(room_id)
     state = room.get_state()
     connected_players = connection_manager.get_connected_player_ids(room_id)
@@ -57,12 +180,14 @@ def _get_room_state(room_id: str) -> dict:
     return state
 
 async def _broadcast_room_state(room_id: str):
+    room_id = normalize_room_id(room_id)
     await connection_manager.broadcast(
         room_id, 
         {"type": "ROOM_STATE_UPDATE", "payload": _get_room_state(room_id)}
     )
 
 async def _broadcast_game_states(room_id: str):
+    room_id = normalize_room_id(room_id)
     room = room_manager.get_room(room_id)
     if room.status != RoomStatus.IN_GAME or room.engine is None:
         return
@@ -78,6 +203,7 @@ async def _broadcast_game_states(room_id: str):
 
 @app.websocket("/ws/rooms/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
+    room_id = normalize_room_id(room_id)
     # 1. Validate session token
     if token not in session_tokens:
         await websocket.close(code=1008, reason="Invalid session token")
@@ -97,9 +223,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     except MendiCotError:
         await websocket.close(code=1008, reason="Room not found")
         return
+    if player_id not in room.player_ids:
+        invalidate_player_tokens(room_id, player_id)
+        await websocket.close(code=1008, reason="Player session is no longer valid")
+        return
 
     # 3. Register WebSocket
     await connection_manager.connect(room_id, player_id, websocket)
+    _cancel_disconnect_cleanup(room_id, player_id)
 
     try:
         # 4 & 5. Handle initial state sync
@@ -130,8 +261,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             
             try:
                 if action == "START_GAME":
-                    hidden_trump_mode = payload.get("hidden_trump_mode", False)
-                    room.start_game(player_id, hidden_trump_mode=hidden_trump_mode)
+                    # The action envelope remains backward compatible, but the room
+                    # configuration is the authoritative source for trump mode.
+                    room.start_game(player_id)
                     
                 elif action == "SELECT_TRUMP_HIDER":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -177,11 +309,25 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     room.engine.resolve_trick()
                     
                 elif action == "LEAVE_ROOM":
-                    room_manager.leave_room(room_id, player_id)
-                    connection_manager.disconnect(room_id, player_id)
+                    if room.status != RoomStatus.WAITING:
+                        raise MendiCotError(
+                            "Cannot leave an active game; game players are preserved."
+                        )
+
+                    # Reply while this socket is still registered, then make the
+                    # leave irreversible before closing it.
+                    await connection_manager.send_to_player(
+                        room_id, player_id,
+                        {"type": "ACTION_SUCCESS", "payload": {"action": action}},
+                    )
+                    connection_manager.disconnect(room_id, player_id, websocket)
+                    _cancel_disconnect_cleanup(room_id, player_id)
+                    await _remove_lobby_player(room_id, player_id)
+
                     await websocket.close(code=1000)
-                    await _broadcast_room_state(room_id)
-                    break
+                    # Do not fall through to generic success/broadcast logic or
+                    # process another message from a deliberately left socket.
+                    return
                     
                 else:
                     await connection_manager.send_to_player(
@@ -197,7 +343,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 )
                 
                 # Broadcast state updates
-                if action in ("START_GAME", "LEAVE_ROOM"):
+                if action == "START_GAME":
                     await _broadcast_room_state(room_id)
                 if room.status == RoomStatus.IN_GAME:
                     await _broadcast_game_states(room_id)
@@ -216,15 +362,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 )
 
     except WebSocketDisconnect:
-        connection_manager.disconnect(room_id, player_id)
-        
-        try:
-            room = room_manager.get_room(room_id)
-            await _broadcast_room_state(room_id)
-            if room.status == RoomStatus.IN_GAME:
-                await connection_manager.broadcast(
-                    room_id,
-                    {"type": "PLAYER_OFFLINE", "payload": {"player_id": player_id}}
-                )
-        except MendiCotError:
-            pass
+        pass
+    finally:
+        # Intentional leave and stale replaced sockets are no-ops because they
+        # are no longer the exact registered socket.
+        await _handle_socket_disconnect(room_id, player_id, websocket)

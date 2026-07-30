@@ -17,9 +17,15 @@ def reset_state():
     session_tokens.clear()
     yield
 
-def setup_room_with_players(num_players: int = 4) -> tuple[str, List[Dict[str, str]]]:
+def setup_room_with_players(
+    num_players: int = 4, trump_mode: str = "normal"
+) -> tuple[str, List[Dict[str, str]]]:
     """Helper to create a room and join N players. Returns (room_id, list_of_player_data)."""
-    resp = client.post("/api/rooms")
+    configured_player_count = max(num_players, 4)
+    resp = client.post(
+        "/api/rooms",
+        json={"player_count": configured_player_count, "trump_mode": trump_mode},
+    )
     room_id = resp.json()["room_id"]
     
     players = []
@@ -198,7 +204,7 @@ def test_ws_normal_trump_gameplay():
 # --- 5. HIDDEN TRUMP MODE OVER WEBSOCKET ---
 @pytest.mark.parametrize("num_players", [4, 6, 8])
 def test_ws_hidden_trump_lifecycle(num_players):
-    room_id, players = setup_room_with_players(num_players)
+    room_id, players = setup_room_with_players(num_players, trump_mode="hidden")
     
     host = players[0]
     hider = players[1]

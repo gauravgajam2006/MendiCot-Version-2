@@ -52,6 +52,30 @@ def test_room_capacity_enforced():
     with pytest.raises(RoomFull):
         room.add_player("P9")
 
+
+def test_configured_room_capacity_is_enforced():
+    room = GameRoom("four_player_room", configured_player_count=4, trump_mode="normal")
+    for i in range(1, 5):
+        room.add_player(f"P{i}")
+
+    with pytest.raises(RoomFull, match="configured capacity \(4\)"):
+        room.add_player("P5")
+
+
+def test_room_state_includes_configuration():
+    room = GameRoom("hidden_room", configured_player_count=6, trump_mode="hidden")
+    assert room.get_state()["player_count"] == 6
+    assert room.get_state()["trump_mode"] == "hidden"
+
+
+def test_room_start_uses_stored_trump_mode():
+    room = GameRoom("hidden_room", configured_player_count=4, trump_mode="hidden")
+    for i in range(1, 5):
+        room.add_player(f"P{i}")
+
+    room.start_game("P1")
+    assert room.engine.state.hidden_trump_mode is True
+
 def test_host_leaving_before_start_transfers_host():
     room = GameRoom("test_room")
     room.add_player("P1")
