@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import os
 import uuid
 from typing import Dict, Any
@@ -10,11 +12,18 @@ from mendicot.room_manager import RoomManager
 from mendicot.room import RoomStatus
 from mendicot.enums import GamePhase, Suit
 from mendicot.models import Card
-from mendicot.exceptions import MendiCotError
+from mendicot.exceptions import MendiCotError, RoomNotFound
 from mendicot.room_ids import normalize_room_id
 
 from .connection_manager import ConnectionManager
-from .schemas import CreateRoomRequest, JoinRoomRequest, JoinRoomResponse, CreateRoomResponse
+from .schemas import (
+    CreateRoomRequest,
+    CreateRoomResponse,
+    JoinRoomRequest,
+    JoinRoomResponse,
+    ValidateSessionRequest,
+    ValidateSessionResponse,
+)
 
 app = FastAPI(title="MendiCot API")
 app.add_middleware(
@@ -31,6 +40,10 @@ connection_manager = ConnectionManager()
 
 # session_token -> {"room_id": str, "player_id": str}
 session_tokens: Dict[str, Dict[str, str]] = {}
+# SHA-256(session_token) -> {"room_id": str, "player_id": str}. Keeping a
+# one-way tombstone lets REST preflight distinguish an expired saved session
+# from an arbitrary credential without retaining or logging the raw token.
+invalidated_session_tokens: Dict[str, Dict[str, str]] = {}
 # Offline players retain their lobby seat and credential during this interval.
 # Tests may monkeypatch this value to avoid waiting for the production default.
 DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS = float(
@@ -39,11 +52,23 @@ DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS = float(
 _disconnect_cleanup_tasks: Dict[tuple[str, str], asyncio.Task] = {}
 
 
+def _session_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _remember_invalidated_session(token: str, session: Dict[str, str]) -> None:
+    invalidated_session_tokens[_session_token_digest(token)] = {
+        "room_id": normalize_room_id(session["room_id"]),
+        "player_id": session["player_id"],
+    }
+
+
 def invalidate_player_tokens(room_id: str, player_id: str) -> None:
     """Invalidate every session token for one player in one room."""
     room_id = normalize_room_id(room_id)
     for token, session in list(session_tokens.items()):
         if session["room_id"] == room_id and session["player_id"] == player_id:
+            _remember_invalidated_session(token, session)
             del session_tokens[token]
 
 
@@ -52,6 +77,7 @@ def invalidate_room_tokens(room_id: str) -> None:
     room_id = normalize_room_id(room_id)
     for token, session in list(session_tokens.items()):
         if session["room_id"] == room_id:
+            _remember_invalidated_session(token, session)
             del session_tokens[token]
 
 
@@ -70,10 +96,12 @@ def _cancel_room_disconnect_cleanups(room_id: str) -> None:
 
 
 def _next_host_id(room, excluded_player_id: str) -> str | None:
-    """Return the lowest-seat online player other than the departing player."""
+    """Prefer the lowest-seat online player, then the lowest-seat remaining player."""
     candidates = [p.player_id for p in room._players if p.player_id != excluded_player_id]
     online = connection_manager.get_connected_player_ids(room.room_id)
-    return next((player_id for player_id in candidates if player_id in online), None)
+    return next((player_id for player_id in candidates if player_id in online), None) or (
+        candidates[0] if candidates else None
+    )
 
 
 async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
@@ -157,6 +185,7 @@ async def join_room(room_id: str, request: JoinRoomRequest):
         raise HTTPException(status_code=400, detail=str(e))
     
     session_token = str(uuid.uuid4())
+    invalidated_session_tokens.pop(_session_token_digest(session_token), None)
     session_tokens[session_token] = {
         "room_id": room_id,
         "player_id": request.player_id
@@ -167,6 +196,78 @@ async def join_room(room_id: str, request: JoinRoomRequest):
         player_id=request.player_id,
         session_token=session_token
     )
+
+
+def _raise_session_error(status_code: int, code: str, message: str) -> None:
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+@app.post(
+    "/api/rooms/{room_id}/sessions/validate",
+    response_model=ValidateSessionResponse,
+)
+async def validate_session(room_id: str, request: ValidateSessionRequest):
+    """Read-only preflight for a saved room session.
+
+    WebSocket authentication remains independent and authoritative when the
+    client subsequently opens its socket.
+    """
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        _raise_session_error(404, "ROOM_NOT_FOUND", "Room no longer exists.")
+
+    session = session_tokens.get(request.session_token)
+    if session is None:
+        invalidated = invalidated_session_tokens.get(
+            _session_token_digest(request.session_token)
+        )
+        if (
+            invalidated is not None
+            and hmac.compare_digest(invalidated["room_id"], room_id)
+            and hmac.compare_digest(invalidated["player_id"], request.player_id)
+        ):
+            _raise_session_error(
+                410, "SESSION_EXPIRED", "Player session has expired."
+            )
+        _raise_session_error(401, "INVALID_SESSION", "Session token is invalid.")
+
+    if not (
+        hmac.compare_digest(session["room_id"], room_id)
+        and hmac.compare_digest(session["player_id"], request.player_id)
+    ):
+        _raise_session_error(401, "INVALID_SESSION", "Session token is invalid.")
+
+    player = next(
+        (candidate for candidate in room._players if candidate.player_id == request.player_id),
+        None,
+    )
+    if player is None:
+        _raise_session_error(410, "SESSION_EXPIRED", "Player session has expired.")
+
+    return ValidateSessionResponse(
+        valid=True,
+        room_id=room.room_id,
+        player_id=player.player_id,
+        display_name=player.display_name,
+        room_status=room.status.value,
+        player_online=(
+            connection_manager.get_connection(room_id, player.player_id) is not None
+        ),
+    )
+
+
+def _schedule_failed_disconnect_cleanups(
+    room_id: str, failed_connections: list[tuple[str, WebSocket]]
+) -> None:
+    """Give broadcast failures the same grace-period treatment as disconnects."""
+    for player_id, _ in failed_connections:
+        if connection_manager.get_connection(room_id, player_id) is None:
+            _schedule_disconnect_cleanup(room_id, player_id)
 
 def _get_room_state(room_id: str) -> dict:
     room_id = normalize_room_id(room_id)
@@ -181,11 +282,19 @@ def _get_room_state(room_id: str) -> dict:
 
 async def _broadcast_room_state(room_id: str):
     room_id = normalize_room_id(room_id)
-    await connection_manager.broadcast(
-        room_id, 
-        {"type": "ROOM_STATE_UPDATE", "payload": _get_room_state(room_id)}
+    failed_connections = await connection_manager.broadcast(
+        room_id,
+        {"type": "ROOM_STATE_UPDATE", "payload": _get_room_state(room_id)},
     )
-
+    _schedule_failed_disconnect_cleanups(room_id, failed_connections)
+    if failed_connections:
+        # One follow-up update reflects failed sockets as offline to healthy
+        # clients, without recursively broadcasting on further failures.
+        follow_up_failures = await connection_manager.broadcast(
+            room_id,
+            {"type": "ROOM_STATE_UPDATE", "payload": _get_room_state(room_id)},
+        )
+        _schedule_failed_disconnect_cleanups(room_id, follow_up_failures)
 async def _broadcast_game_states(room_id: str):
     room_id = normalize_room_id(room_id)
     room = room_manager.get_room(room_id)
@@ -193,13 +302,20 @@ async def _broadcast_game_states(room_id: str):
         return
         
     connected_players = connection_manager.get_connected_player_ids(room_id)
+    failed_players: list[str] = []
     for player_id in connected_players:
         view = room.engine.get_player_view(player_id)
         encoded_view = jsonable_encoder(view)
-        await connection_manager.send_to_player(
-            room_id, player_id, 
-            {"type": "GAME_STATE_UPDATE", "payload": encoded_view}
+        delivered = await connection_manager.send_to_player(
+            room_id, player_id,
+            {"type": "GAME_STATE_UPDATE", "payload": encoded_view},
         )
+        if not delivered and connection_manager.get_connection(room_id, player_id) is None:
+            failed_players.append(player_id)
+    for player_id in failed_players:
+        _schedule_disconnect_cleanup(room_id, player_id)
+    if failed_players:
+        await _broadcast_room_state(room_id)
 
 @app.websocket("/ws/rooms/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
@@ -237,10 +353,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
         if room.status == RoomStatus.WAITING:
             await _broadcast_room_state(room_id)
         elif room.status == RoomStatus.IN_GAME:
-            await connection_manager.send_to_player(
-                room_id, player_id,
-                {"type": "ROOM_STATE_UPDATE", "payload": _get_room_state(room_id)}
-            )
+            # The room-state broadcast is the authoritative online/offline
+            # transition for every client; game state remains player-specific.
+            await _broadcast_room_state(room_id)
             if room.engine:
                 view = room.engine.get_player_view(player_id)
                 await connection_manager.send_to_player(
@@ -363,6 +478,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
     except WebSocketDisconnect:
         pass
+    except Exception:
+        # Keep malformed/interrupted WebSocket traffic from surfacing as an
+        # unhandled ASGI error. The finally block still performs safe cleanup.
+        try:
+            await websocket.close(code=1011, reason="WebSocket processing failed")
+        except Exception:
+            pass
     finally:
         # Intentional leave and stale replaced sockets are no-ops because they
         # are no longer the exact registered socket.

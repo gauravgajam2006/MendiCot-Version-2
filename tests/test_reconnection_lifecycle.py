@@ -8,7 +8,8 @@ from mendicot.exceptions import RoomFull, RoomNotFound
 
 
 class Socket:
-    def __init__(self):
+    def __init__(self, fail_send=False):
+        self.fail_send = fail_send
         self.accepted = False
         self.closed = False
         self.messages = []
@@ -20,6 +21,8 @@ class Socket:
         self.closed = True
 
     async def send_json(self, message):
+        if self.fail_send:
+            raise OSError("socket send failed")
         self.messages.append(message)
 
 
@@ -203,4 +206,79 @@ def test_final_player_timeout_deletes_room_and_all_state(monkeypatch):
         assert "room" not in routes.connection_manager.active_connections
         assert not routes.session_tokens
         assert not routes._disconnect_cleanup_tasks
+    asyncio.run(run())
+
+def test_two_players_refreshing_close_together_remain_stable(monkeypatch):
+    async def run():
+        monkeypatch.setattr(routes, "DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", 0.04)
+        room = seed_room(("P1", "P2", "P3"))
+        first_one, first_two = Socket(), Socket()
+        await reconnect("room", "P1", first_one)
+        await reconnect("room", "P2", first_two)
+        await routes._handle_socket_disconnect("room", "P1", first_one)
+        await routes._handle_socket_disconnect("room", "P2", first_two)
+        await reconnect("room", "P1", Socket())
+        await reconnect("room", "P2", Socket())
+        await asyncio.sleep(0.06)
+        assert room.player_ids == ["P1", "P2", "P3"]
+        assert routes.connection_manager.get_connected_player_ids("ROOM") == {"P1", "P2"}
+        state = routes._get_room_state("room")
+        assert [player["is_online"] for player in state["players"]] == [True, True, False]
+    asyncio.run(run())
+
+
+def test_normal_player_timeout_removes_only_that_player(monkeypatch):
+    async def run():
+        monkeypatch.setattr(routes, "DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", 0.01)
+        room = seed_room(("host", "departing", "remaining"))
+        await reconnect("room", "host", Socket())
+        await reconnect("room", "remaining", Socket())
+        departing_socket = Socket()
+        await reconnect("room", "departing", departing_socket)
+        await routes._handle_socket_disconnect("room", "departing", departing_socket)
+        await asyncio.sleep(0.03)
+        assert room.player_ids == ["host", "remaining"]
+        assert room.host_id == "host"
+        assert "token-departing" not in routes.session_tokens
+        assert routes.connection_manager.get_connected_player_ids("room") == {"host", "remaining"}
+    asyncio.run(run())
+
+
+def test_host_timeout_falls_back_to_lowest_remaining_seat_when_everyone_offline(monkeypatch):
+    async def run():
+        monkeypatch.setattr(routes, "DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", 0.01)
+        room = seed_room(("host", "first-offline", "second-offline"))
+        host_socket = Socket()
+        await reconnect("room", "host", host_socket)
+        await routes._handle_socket_disconnect("room", "host", host_socket)
+        await asyncio.sleep(0.03)
+        assert room.host_id == "first-offline"
+        assert room.player_ids == ["first-offline", "second-offline"]
+    asyncio.run(run())
+
+
+def test_broken_socket_broadcast_does_not_affect_healthy_socket():
+    async def run():
+        manager = ConnectionManager()
+        broken, healthy = Socket(fail_send=True), Socket()
+        await manager.connect("ROOM", "broken", broken)
+        await manager.connect("room", "healthy", healthy)
+        await manager.broadcast("RoOm", {"type": "ROOM_STATE_UPDATE"})
+        assert healthy.messages == [{"type": "ROOM_STATE_UPDATE"}]
+        assert manager.get_connection("room", "healthy") is healthy
+        assert manager.get_connection("room", "broken") is None
+    asyncio.run(run())
+
+def test_broadcast_failure_starts_grace_cleanup_and_updates_healthy_clients():
+    async def run():
+        room = seed_room(("broken", "healthy"))
+        await reconnect("room", "broken", Socket(fail_send=True))
+        healthy = Socket()
+        await reconnect("room", "healthy", healthy)
+        await routes._broadcast_room_state("ROOM")
+        assert ("room", "broken") in routes._disconnect_cleanup_tasks
+        assert routes.connection_manager.get_connection("room", "broken") is None
+        assert routes.connection_manager.get_connection("room", "healthy") is healthy
+        assert len(healthy.messages) == 2
+        assert routes._get_room_state(room.room_id)["players"][0]["is_online"] is False
     asyncio.run(run())

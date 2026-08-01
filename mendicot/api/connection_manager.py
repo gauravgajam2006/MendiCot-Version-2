@@ -58,21 +58,29 @@ class ConnectionManager:
             return set(self.active_connections[room_id].keys())
         return set()
 
-    async def broadcast(self, room_id: str, message: dict):
+    async def broadcast(self, room_id: str, message: dict) -> list[tuple[str, WebSocket]]:
+        """Send independently and return sockets that failed during this send."""
         room_id = normalize_room_id(room_id)
-        if room_id in self.active_connections:
-            for connection in list(self.active_connections[room_id].values()):
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    # Ignore failing connections during broadcast
-                    pass
-
-    async def send_to_player(self, room_id: str, player_id: str, message: dict):
-        room_id = normalize_room_id(room_id)
-        connection = self.get_connection(room_id, player_id)
-        if connection:
+        connections = self.active_connections.get(room_id, {})
+        failed_connections: list[tuple[str, WebSocket]] = []
+        for player_id, connection in list(connections.items()):
             try:
                 await connection.send_json(message)
             except Exception:
-                pass
+                # A failed send affects only this exact socket. Do not let a
+                # stale failure remove a replacement that connected meanwhile.
+                if self.disconnect(room_id, player_id, connection):
+                    failed_connections.append((player_id, connection))
+        return failed_connections
+
+    async def send_to_player(self, room_id: str, player_id: str, message: dict) -> bool:
+        room_id = normalize_room_id(room_id)
+        connection = self.get_connection(room_id, player_id)
+        if connection is None:
+            return False
+        try:
+            await connection.send_json(message)
+            return True
+        except Exception:
+            self.disconnect(room_id, player_id, connection)
+            return False
