@@ -76,3 +76,15 @@ class NotRoomHost(RoomError):
 
 class PlayerNotInRoom(RoomError):
     """Raised when referencing a player not in the room."""
+
+class InvalidTeam(RoomError):
+    """Raised when a lobby team ID is not supported."""
+
+class RoomNotFull(RoomError):
+    """Raised when starting before the configured room capacity is reached."""
+
+class PlayerOffline(RoomError):
+    """Raised when starting while one or more lobby players are offline."""
+
+class TeamsUnbalanced(RoomError):
+    """Raised when lobby teams are invalid or are not equally sized."""

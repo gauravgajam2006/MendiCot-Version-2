@@ -1,4 +1,5 @@
 import time
+from contextlib import ExitStack
 
 import pytest
 from fastapi.testclient import TestClient
@@ -130,8 +131,16 @@ def test_in_game_leave_returns_error_without_changing_engine_players():
     room_id = create_room(4)
     players = [join(room_id, f"P{i}") for i in range(4)]
 
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={players[0]['session_token']}") as host_ws:
-        receive_type(host_ws, "ROOM_STATE_UPDATE")
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        host_ws = websockets[0]
         host_ws.send_json({"action": "START_GAME", "payload": {}})
         receive_type(host_ws, "ACTION_SUCCESS")
         before = list(room_manager.get_room(room_id).engine.state.players)

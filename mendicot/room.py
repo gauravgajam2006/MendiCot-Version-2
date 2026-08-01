@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .engine import MendiCotEngine
+from .enums import TeamId
 from .room_ids import normalize_room_id
 from .models import Player
 from .exceptions import (
@@ -12,6 +13,10 @@ from .exceptions import (
     PlayerNotInRoom,
     InvalidRoomSize,
     NotRoomHost,
+    InvalidTeam,
+    PlayerOffline,
+    RoomNotFull,
+    TeamsUnbalanced,
 )
 
 
@@ -24,6 +29,9 @@ class RoomStatus(str, enum.Enum):
 class RoomPlayer:
     player_id: str
     display_name: str
+    team_id: TeamId
+    seat_index: int
+    is_online: bool = False
 
 
 class GameRoom:
@@ -43,6 +51,7 @@ class GameRoom:
         self.trump_mode = trump_mode
         self.host_id: Optional[str] = None
         self._players: list[RoomPlayer] = []
+        self._next_join_index = 0
         self._status = RoomStatus.WAITING
         self.engine: Optional[MendiCotEngine] = None
 
@@ -58,6 +67,23 @@ class GameRoom:
     def status(self) -> RoomStatus:
         return self._status
 
+    def _next_available_seat_index(self) -> int:
+        occupied_seats = {player.seat_index for player in self._players}
+        return next(
+            seat_index
+            for seat_index in range(self.configured_player_count)
+            if seat_index not in occupied_seats
+        )
+
+    def get_player(self, player_id: str) -> RoomPlayer:
+        player = next(
+            (candidate for candidate in self._players if candidate.player_id == player_id),
+            None,
+        )
+        if player is None:
+            raise PlayerNotInRoom(f"Player {player_id} not found in the room.")
+        return player
+
     def add_player(self, player_id: str, display_name: Optional[str] = None) -> None:
         if self._status == RoomStatus.IN_GAME:
             raise GameAlreadyStarted("Cannot join room after the game has started.")
@@ -70,11 +96,19 @@ class GameRoom:
                 f"Room has reached configured capacity ({self.configured_player_count})."
             )
 
+        seat_index = self._next_available_seat_index()
         player = RoomPlayer(
-            player_id=player_id, 
-            display_name=display_name or player_id
+            player_id=player_id,
+            display_name=display_name or player_id,
+            team_id=(
+                TeamId.TEAM_A
+                if self._next_join_index % 2 == 0
+                else TeamId.TEAM_B
+            ),
+            seat_index=seat_index,
         )
         self._players.append(player)
+        self._next_join_index += 1
 
         if self.host_id is None:
             self.host_id = player_id
@@ -95,35 +129,115 @@ class GameRoom:
             else:
                 self.host_id = None
 
-    def start_game(self, requester_id: str) -> None:
+    def set_player_online(self, player_id: str, is_online: bool) -> None:
+        self.get_player(player_id).is_online = is_online
+
+    def switch_team(self, player_id: str, team_id: str | None) -> None:
+        if self._status == RoomStatus.IN_GAME:
+            raise GameAlreadyStarted("Cannot switch teams after the game has started.")
+
+        try:
+            requested_team = TeamId(team_id)
+        except (TypeError, ValueError) as exc:
+            raise InvalidTeam(
+                f"Team must be one of: {TeamId.TEAM_A.value}, {TeamId.TEAM_B.value}."
+            ) from exc
+
+        # Assigning the existing value is intentionally idempotent.
+        self.get_player(player_id).team_id = requested_team
+
+    def _validate_teams_for_start(self) -> None:
+        team_counts = {team_id: 0 for team_id in TeamId}
+        for player in self._players:
+            try:
+                team_counts[TeamId(player.team_id)] += 1
+            except (TypeError, ValueError) as exc:
+                raise TeamsUnbalanced(
+                    "Every player must belong to TeamA or TeamB."
+                ) from exc
+
+        required_team_size = self.configured_player_count // 2
+        if any(count != required_team_size for count in team_counts.values()):
+            raise TeamsUnbalanced(
+                f"Teams must contain {required_team_size} players each."
+            )
+
+    def _build_engine_players(self) -> list[Player]:
+        """Interleave selected teams while preserving lobby order within each team."""
+        lobby_order = sorted(self._players, key=lambda player: player.seat_index)
+        first_team = TeamId(lobby_order[0].team_id)
+        second_team = (
+            TeamId.TEAM_B if first_team == TeamId.TEAM_A else TeamId.TEAM_A
+        )
+        players_by_team = {
+            team_id: [
+                player
+                for player in lobby_order
+                if TeamId(player.team_id) == team_id
+            ]
+            for team_id in TeamId
+        }
+
+        engine_order: list[RoomPlayer] = []
+        for first_player, second_player in zip(
+            players_by_team[first_team], players_by_team[second_team]
+        ):
+            engine_order.extend((first_player, second_player))
+
+        return [
+            Player(
+                player_id=room_player.player_id,
+                team_id=TeamId(room_player.team_id).value,
+                seat_index=engine_seat_index,
+            )
+            for engine_seat_index, room_player in enumerate(engine_order)
+        ]
+
+    def start_game(
+        self,
+        requester_id: str,
+        online_player_ids: set[str] | None = None,
+    ) -> None:
         if requester_id != self.host_id:
             raise NotRoomHost("Only the room host can start the game.")
         
         if self._status == RoomStatus.IN_GAME:
             raise GameAlreadyStarted("The game has already started.")
             
-        if self.player_count not in self.VALID_START_COUNTS:
-            raise InvalidRoomSize(f"Cannot start game with {self.player_count} players. Must be {', '.join(map(str, self.VALID_START_COUNTS))}.")
+        if self.configured_player_count not in self.VALID_START_COUNTS:
+            raise InvalidRoomSize(
+                "Configured room size must be 4, 6, or 8 players."
+            )
 
-        # Convert RoomPlayers to Engine Players
-        engine_players = []
-        for index, rp in enumerate(self._players):
-            # Alternating teams: even index -> TeamA, odd index -> TeamB
-            team_id = "TeamA" if index % 2 == 0 else "TeamB"
-            engine_players.append(Player(
-                player_id=rp.player_id,
-                team_id=team_id,
-                seat_index=index
-            ))
+        if self.player_count != self.configured_player_count:
+            raise RoomNotFull(
+                f"Room requires {self.configured_player_count} players before starting."
+            )
 
-        self.engine = MendiCotEngine()
-        self.engine.create_game(
+        if online_player_ids is None:
+            online_player_ids = {
+                player.player_id for player in self._players if player.is_online
+            }
+        offline_players = [
+            player.player_id
+            for player in sorted(self._players, key=lambda player: player.seat_index)
+            if player.player_id not in online_player_ids
+        ]
+        if offline_players:
+            raise PlayerOffline(
+                f"All players must be online before starting: {', '.join(offline_players)}."
+            )
+
+        self._validate_teams_for_start()
+
+        engine = MendiCotEngine()
+        engine.create_game(
             game_id=self.room_id,
-            players=engine_players,
+            players=self._build_engine_players(),
             host_id=self.host_id,
             hidden_trump_mode=self.trump_mode == "hidden"
         )
-        
+        self.engine = engine
         self._status = RoomStatus.IN_GAME
 
     def get_state(self) -> dict:
@@ -136,7 +250,12 @@ class GameRoom:
             "players": [
                 {
                     "player_id": p.player_id,
-                    "display_name": p.display_name
-                } for p in self._players
+                    "display_name": p.display_name,
+                    "team_id": TeamId(p.team_id).value,
+                    "seat_index": p.seat_index,
+                    "is_online": p.is_online,
+                } for p in sorted(
+                    self._players, key=lambda player: player.seat_index
+                )
             ]
         }

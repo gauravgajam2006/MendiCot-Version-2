@@ -15,6 +15,11 @@ from mendicot.exceptions import (
 
 # ----------------- GameRoom Tests -----------------
 
+def mark_all_online(room):
+    for player_id in room.player_ids:
+        room.set_player_online(player_id, True)
+
+
 def test_room_starts_empty():
     room = GameRoom("test_room")
     assert room.room_id == "test_room"
@@ -73,6 +78,7 @@ def test_room_start_uses_stored_trump_mode():
     for i in range(1, 5):
         room.add_player(f"P{i}")
 
+    mark_all_online(room)
     room.start_game("P1")
     assert room.engine.state.hidden_trump_mode is True
 
@@ -99,18 +105,19 @@ def test_remove_unknown_player_raises_error():
         room.remove_player("P1")
 
 def test_only_host_can_start_game():
-    room = GameRoom("test_room")
+    room = GameRoom("test_room", configured_player_count=4)
     for i in range(1, 5):
         room.add_player(f"P{i}")
     
     with pytest.raises(NotRoomHost):
         room.start_game("P2")
-    
+
+    mark_all_online(room)
     room.start_game("P1")
     assert room.status == RoomStatus.IN_GAME
 
 def test_cannot_start_with_invalid_player_count():
-    room = GameRoom("test_room")
+    room = GameRoom("test_room", configured_player_count=3)
     room.add_player("P1")
     room.add_player("P2")
     room.add_player("P3")
@@ -119,46 +126,52 @@ def test_cannot_start_with_invalid_player_count():
         room.start_game("P1")
 
 def test_can_start_with_valid_player_counts():
-    room_4 = GameRoom("room_4")
+    room_4 = GameRoom("room_4", configured_player_count=4)
     for i in range(1, 5): room_4.add_player(f"P{i}")
+    mark_all_online(room_4)
     room_4.start_game("P1")
     assert room_4.status == RoomStatus.IN_GAME
 
-    room_6 = GameRoom("room_6")
+    room_6 = GameRoom("room_6", configured_player_count=6)
     for i in range(1, 7): room_6.add_player(f"P{i}")
+    mark_all_online(room_6)
     room_6.start_game("P1")
     assert room_6.status == RoomStatus.IN_GAME
 
     room_8 = GameRoom("room_8")
     for i in range(1, 9): room_8.add_player(f"P{i}")
+    mark_all_online(room_8)
     room_8.start_game("P1")
     assert room_8.status == RoomStatus.IN_GAME
 
 def test_game_cannot_start_twice():
-    room = GameRoom("test_room")
+    room = GameRoom("test_room", configured_player_count=4)
     for i in range(1, 5):
         room.add_player(f"P{i}")
-    
+
+    mark_all_online(room)
     room.start_game("P1")
     
     with pytest.raises(GameAlreadyStarted):
         room.start_game("P1")
 
 def test_players_cannot_join_after_game_starts():
-    room = GameRoom("test_room")
+    room = GameRoom("test_room", configured_player_count=4)
     for i in range(1, 5):
         room.add_player(f"P{i}")
-    
+
+    mark_all_online(room)
     room.start_game("P1")
     
     with pytest.raises(GameAlreadyStarted):
         room.add_player("P5")
 
 def test_players_cannot_leave_after_game_starts():
-    room = GameRoom("test_room")
+    room = GameRoom("test_room", configured_player_count=4)
     for i in range(1, 5):
         room.add_player(f"P{i}")
-    
+
+    mark_all_online(room)
     room.start_game("P1")
     
     with pytest.raises(GameAlreadyStarted):
@@ -219,8 +232,8 @@ def test_manager_join_and_leave_room():
 
 def test_engine_isolation():
     manager = RoomManager()
-    room_a = manager.create_room("room_a")
-    room_b = manager.create_room("room_b")
+    room_a = manager.create_room("room_a", player_count=4)
+    room_b = manager.create_room("room_b", player_count=4)
     
     # Populate Room A
     for i in range(1, 5):
@@ -229,7 +242,9 @@ def test_engine_isolation():
     # Populate Room B
     for i in range(1, 5):
         manager.join_room("room_b", f"B{i}")
-        
+
+    mark_all_online(room_a)
+    mark_all_online(room_b)
     room_a.start_game("A1")
     room_b.start_game("B1")
     

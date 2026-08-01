@@ -12,7 +12,18 @@ from mendicot.room_manager import RoomManager
 from mendicot.room import RoomStatus
 from mendicot.enums import GamePhase, Suit
 from mendicot.models import Card
-from mendicot.exceptions import MendiCotError, RoomNotFound
+from mendicot.exceptions import (
+    GameAlreadyStarted,
+    InvalidPhase,
+    InvalidTeam,
+    MendiCotError,
+    NotRoomHost,
+    PlayerNotInRoom,
+    PlayerOffline,
+    RoomNotFound,
+    RoomNotFull,
+    TeamsUnbalanced,
+)
 from mendicot.room_ids import normalize_room_id
 
 from .connection_manager import ConnectionManager
@@ -50,6 +61,72 @@ DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS = float(
     os.getenv("MENDICOT_DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", "10")
 )
 _disconnect_cleanup_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+
+_ACTION_ERROR_CODES = {
+    InvalidTeam: "INVALID_TEAM",
+    GameAlreadyStarted: "GAME_ALREADY_STARTED",
+    PlayerNotInRoom: "PLAYER_NOT_FOUND",
+    InvalidPhase: "INVALID_PHASE",
+    NotRoomHost: "HOST_ONLY",
+    RoomNotFull: "ROOM_NOT_FULL",
+    PlayerOffline: "PLAYER_OFFLINE",
+    TeamsUnbalanced: "TEAMS_UNBALANCED",
+}
+
+
+def _action_error_code(error: Exception) -> str:
+    return next(
+        (
+            code
+            for exception_type, code in _ACTION_ERROR_CODES.items()
+            if isinstance(error, exception_type)
+        ),
+        error.__class__.__name__,
+    )
+
+
+async def _send_action_error(
+    room_id: str,
+    player_id: str,
+    action: Any,
+    code: str,
+    message: str,
+) -> None:
+    delivered = await connection_manager.send_to_player(
+        room_id,
+        player_id,
+        {
+            "type": "ERROR",
+            "payload": {
+                "action": action,
+                "code": code,
+                "message": message,
+            },
+        },
+    )
+    if not delivered:
+        await _handle_failed_direct_send(room_id, player_id)
+
+
+async def _handle_failed_direct_send(room_id: str, player_id: str) -> None:
+    """Give a failed one-player reply the normal offline grace treatment."""
+    if connection_manager.get_connection(room_id, player_id) is not None:
+        return
+    try:
+        room = room_manager.get_room(room_id)
+        room.set_player_online(player_id, False)
+    except MendiCotError:
+        return
+    _schedule_disconnect_cleanup(room_id, player_id)
+    await _broadcast_room_state(room_id)
+    if (
+        room.status == RoomStatus.IN_GAME
+        and connection_manager.get_connection(room_id, player_id) is None
+    ):
+        await connection_manager.broadcast(
+            room_id,
+            {"type": "PLAYER_OFFLINE", "payload": {"player_id": player_id}},
+        )
 
 
 def _session_token_digest(token: str) -> str:
@@ -97,7 +174,11 @@ def _cancel_room_disconnect_cleanups(room_id: str) -> None:
 
 def _next_host_id(room, excluded_player_id: str) -> str | None:
     """Prefer the lowest-seat online player, then the lowest-seat remaining player."""
-    candidates = [p.player_id for p in room._players if p.player_id != excluded_player_id]
+    candidates = [
+        player.player_id
+        for player in sorted(room._players, key=lambda player: player.seat_index)
+        if player.player_id != excluded_player_id
+    ]
     online = connection_manager.get_connected_player_ids(room.room_id)
     return next((player_id for player_id in candidates if player_id in online), None) or (
         candidates[0] if candidates else None
@@ -159,6 +240,7 @@ async def _handle_socket_disconnect(
         return
     try:
         room = room_manager.get_room(room_id)
+        room.set_player_online(player_id, False)
         _schedule_disconnect_cleanup(room_id, player_id)
         await _broadcast_room_state(room_id)
         if room.status == RoomStatus.IN_GAME:
@@ -267,18 +349,19 @@ def _schedule_failed_disconnect_cleanups(
     """Give broadcast failures the same grace-period treatment as disconnects."""
     for player_id, _ in failed_connections:
         if connection_manager.get_connection(room_id, player_id) is None:
+            try:
+                room_manager.get_room(room_id).set_player_online(player_id, False)
+            except MendiCotError:
+                pass
             _schedule_disconnect_cleanup(room_id, player_id)
 
 def _get_room_state(room_id: str) -> dict:
     room_id = normalize_room_id(room_id)
     room = room_manager.get_room(room_id)
-    state = room.get_state()
     connected_players = connection_manager.get_connected_player_ids(room_id)
-    
-    for p in state["players"]:
-        p["is_online"] = p["player_id"] in connected_players
-        
-    return state
+    for player in room._players:
+        player.is_online = player.player_id in connected_players
+    return room.get_state()
 
 async def _broadcast_room_state(room_id: str):
     room_id = normalize_room_id(room_id)
@@ -346,6 +429,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
     # 3. Register WebSocket
     await connection_manager.connect(room_id, player_id, websocket)
+    room.set_player_online(player_id, True)
     _cancel_disconnect_cleanup(room_id, player_id)
 
     try:
@@ -378,7 +462,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 if action == "START_GAME":
                     # The action envelope remains backward compatible, but the room
                     # configuration is the authoritative source for trump mode.
-                    room.start_game(player_id)
+                    room.start_game(
+                        player_id,
+                        connection_manager.get_connected_player_ids(room_id),
+                    )
+
+                elif action == "SWITCH_TEAM":
+                    team_id = (
+                        payload.get("team_id")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    room.switch_team(player_id, team_id)
                     
                 elif action == "SELECT_TRUMP_HIDER":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -445,35 +540,45 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     return
                     
                 else:
-                    await connection_manager.send_to_player(
-                        room_id, player_id,
-                        {"type": "ERROR", "payload": {"code": "UNKNOWN_ACTION", "message": f"Action {action} is unknown."}}
+                    await _send_action_error(
+                        room_id,
+                        player_id,
+                        action,
+                        "UNKNOWN_ACTION",
+                        f"Action {action} is unknown.",
                     )
                     continue
 
                 # Action succeeded
-                await connection_manager.send_to_player(
-                    room_id, player_id,
-                    {"type": "ACTION_SUCCESS", "payload": {"action": action}}
+                delivered = await connection_manager.send_to_player(
+                    room_id,
+                    player_id,
+                    {"type": "ACTION_SUCCESS", "payload": {"action": action}},
                 )
+                if not delivered:
+                    await _handle_failed_direct_send(room_id, player_id)
                 
                 # Broadcast state updates
-                if action == "START_GAME":
+                if delivered and action in ("START_GAME", "SWITCH_TEAM"):
                     await _broadcast_room_state(room_id)
                 if room.status == RoomStatus.IN_GAME:
                     await _broadcast_game_states(room_id)
                     
             except MendiCotError as e:
-                error_code = e.__class__.__name__
-                # Special handling for enum conversion errors etc. could go here
-                await connection_manager.send_to_player(
-                    room_id, player_id,
-                    {"type": "ERROR", "payload": {"code": error_code, "message": str(e)}}
+                await _send_action_error(
+                    room_id,
+                    player_id,
+                    action,
+                    _action_error_code(e),
+                    str(e),
                 )
-            except ValueError as e: # e.g. Suit(suit_str) fails
-                 await connection_manager.send_to_player(
-                    room_id, player_id,
-                    {"type": "ERROR", "payload": {"code": "INVALID_PAYLOAD", "message": str(e)}}
+            except ValueError as e:  # e.g. Suit(suit_str) fails
+                await _send_action_error(
+                    room_id,
+                    player_id,
+                    action,
+                    "INVALID_PAYLOAD",
+                    str(e),
                 )
 
     except WebSocketDisconnect:

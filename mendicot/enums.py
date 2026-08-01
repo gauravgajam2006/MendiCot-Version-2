@@ -35,6 +35,10 @@ class TrumpStatus(str, Enum):
     HIDDEN = "HIDDEN"
     PUBLIC = "PUBLIC"
 
+class TeamId(str, Enum):
+    TEAM_A = "TeamA"
+    TEAM_B = "TeamB"
+
 class ActionType(str, Enum):
     PLAY_CARD = "PLAY_CARD"
     REVEAL_TRUMP = "REVEAL_TRUMP"

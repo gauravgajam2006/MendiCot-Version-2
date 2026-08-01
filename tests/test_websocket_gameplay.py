@@ -118,24 +118,37 @@ def test_ws_lobby_disconnect_reconnect():
 # --- 3. HOST PERMISSIONS ---
 def test_ws_host_permissions():
     room_id, players = setup_room_with_players(4)
-    
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={players[0]['session_token']}") as host_ws, \
-         client.websocket_connect(f"/ws/rooms/{room_id}?token={players[1]['session_token']}") as non_host_ws:
-            
-            # Non-host tries to start game
-            non_host_ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
-            err = wait_for_message(non_host_ws, "ERROR")
-            assert err["payload"]["code"] == "NotRoomHost"
-            
-            # Host starts game
-            host_ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
-            wait_for_message(host_ws, "ACTION_SUCCESS")
-            
-            # Non-host tries DEAL_CARDS
-            non_host_ws.send_json({"action": "DEAL_CARDS"})
-            err = wait_for_message(non_host_ws, "ERROR")
-            assert err["payload"]["code"] == "MendiCotError"
-            assert "Only host can deal cards" in err["payload"]["message"]
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        host_ws, non_host_ws = websockets[:2]
+
+        # Non-host tries to start game
+        non_host_ws.send_json(
+            {"action": "START_GAME", "payload": {"hidden_trump_mode": False}}
+        )
+        err = wait_for_message(non_host_ws, "ERROR")
+        assert err["payload"]["code"] == "HOST_ONLY"
+        assert err["payload"]["action"] == "START_GAME"
+
+        # Host starts game
+        host_ws.send_json(
+            {"action": "START_GAME", "payload": {"hidden_trump_mode": False}}
+        )
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        # Non-host tries DEAL_CARDS
+        non_host_ws.send_json({"action": "DEAL_CARDS"})
+        err = wait_for_message(non_host_ws, "ERROR")
+        assert err["payload"]["code"] == "MendiCotError"
+        assert "Only host can deal cards" in err["payload"]["message"]
 
 # --- 4. NORMAL TRUMP MODE OVER WEBSOCKET ---
 def test_ws_normal_trump_gameplay():
@@ -205,24 +218,33 @@ def test_ws_normal_trump_gameplay():
 @pytest.mark.parametrize("num_players", [4, 6, 8])
 def test_ws_hidden_trump_lifecycle(num_players):
     room_id, players = setup_room_with_players(num_players, trump_mode="hidden")
-    
-    host = players[0]
-    hider = players[1]
-    
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={host['session_token']}") as host_ws, \
-         client.websocket_connect(f"/ws/rooms/{room_id}?token={hider['session_token']}") as hider_ws, \
-         client.websocket_connect(f"/ws/rooms/{room_id}?token={players[2]['session_token']}") as p3_ws:
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        host_ws, hider_ws, p3_ws = websockets[:3]
          
         # START_GAME hidden
         host_ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": True}})
         wait_for_message(host_ws, "ACTION_SUCCESS")
 
         # SELECT TRUMP HIDER
-        host_ws.send_json({"action": "SELECT_TRUMP_HIDER", "payload": {"player_id": hider["player_id"]}})
+        host_ws.send_json({"action": "SELECT_TRUMP_HIDER", "payload": {"player_id": players[1]["player_id"]}})
         wait_for_message(host_ws, "ACTION_SUCCESS")
             
         # SELECT FIRST PLAYER
-        host_ws.send_json({"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": host["player_id"]}})
+        host_ws.send_json(
+            {
+                "action": "SELECT_FIRST_PLAYER",
+                "payload": {"player_id": players[0]["player_id"]},
+            }
+        )
         wait_for_message(host_ws, "ACTION_SUCCESS")
             
         # DEAL CARDS
@@ -320,9 +342,17 @@ def test_ws_multiplayer_gameplay_8p():
 # --- 7. PRIVATE STATE ISOLATION ---
 def test_ws_private_state_isolation():
     room_id, players = setup_room_with_players(4)
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={players[0]['session_token']}") as ws1, \
-         client.websocket_connect(f"/ws/rooms/{room_id}?token={players[1]['session_token']}") as ws2:
-        
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        ws1, ws2 = websockets[:2]
+
         ws1.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(ws1, "ACTION_SUCCESS")
         ws1.send_json({"action": "DEAL_CARDS"})
@@ -338,10 +368,28 @@ def test_ws_private_state_isolation():
 def test_ws_room_isolation():
     r1, p1 = setup_room_with_players(4)
     r2, p2 = setup_room_with_players(4)
-    
-    with client.websocket_connect(f"/ws/rooms/{r1}?token={p1[0]['session_token']}") as ws1, \
-         client.websocket_connect(f"/ws/rooms/{r2}?token={p2[0]['session_token']}") as ws2:
-        
+
+    with ExitStack() as stack:
+        for player in p1[1:]:
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{r1}?token={player['session_token']}"
+                )
+            )
+        for player in p2[1:]:
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{r2}?token={player['session_token']}"
+                )
+            )
+        ws1 = stack.enter_context(
+            client.websocket_connect(f"/ws/rooms/{r1}?token={p1[0]['session_token']}")
+        )
+        ws2 = stack.enter_context(
+            client.websocket_connect(f"/ws/rooms/{r2}?token={p2[0]['session_token']}")
+        )
+        wait_for_message(ws2, "ROOM_STATE_UPDATE")
+
         ws1.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(ws1, "ACTION_SUCCESS")
         
@@ -351,8 +399,17 @@ def test_ws_room_isolation():
 # --- 9. RECONNECT DURING ACTIVE GAME ---
 def test_ws_reconnect_during_game():
     room_id, players = setup_room_with_players(4)
-    
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={players[1]['session_token']}") as ws2:
+
+    with ExitStack() as stack:
+        connected_players = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players[1:]
+        ]
+        ws2 = connected_players[0]
         # We need ws1 outside context manager so we can close it
         ws1 = client.websocket_connect(f"/ws/rooms/{room_id}?token={players[0]['session_token']}")
         ws1 = ws1.__enter__()
@@ -380,8 +437,16 @@ def test_ws_reconnect_during_game():
 # --- 10. ERROR CONTRACT ---
 def test_ws_error_contract():
     room_id, players = setup_room_with_players(4)
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={players[0]['session_token']}") as ws1, \
-         client.websocket_connect(f"/ws/rooms/{room_id}?token={players[1]['session_token']}") as ws2:
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        ws1, ws2 = websockets[:2]
              
         # Unknown action
         ws1.send_json({"action": "INVALID_ACTION"})
@@ -400,4 +465,4 @@ def test_ws_error_contract():
         # Wrong turn/phase
         ws2.send_json({"action": "PLAY_CARD", "payload": {"suit": "HEARTS", "rank": 2}})
         err3 = wait_for_message(ws2, "ERROR")
-        assert err3["payload"]["code"] in ("InvalidPhase", "MendiCotError")
+        assert err3["payload"]["code"] == "INVALID_PHASE"

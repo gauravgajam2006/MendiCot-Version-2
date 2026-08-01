@@ -1,4 +1,5 @@
 import pytest
+from contextlib import ExitStack
 from fastapi.testclient import TestClient
 
 from mendicot.api.routes import app, connection_manager, room_manager, session_tokens
@@ -6,6 +7,14 @@ from mendicot.enums import GamePhase
 
 
 client = TestClient(app)
+
+
+def receive_type(websocket, message_type, max_messages=20):
+    for _ in range(max_messages):
+        message = websocket.receive_json()
+        if message["type"] == message_type:
+            return message
+    raise AssertionError(f"Did not receive {message_type}")
 
 
 def create_room(player_count: int = 4, trump_mode: str = "normal"):
@@ -123,12 +132,23 @@ def test_start_game_flow():
         ).json()["session_token"]
         for i in range(1, 5)
     ]
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={tokens[0]}") as ws:
-        ws.receive_json()
-        ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
-        assert ws.receive_json()["type"] == "ACTION_SUCCESS"
-        assert ws.receive_json()["payload"]["status"] == "IN_GAME"
-        assert ws.receive_json()["payload"]["phase"] == GamePhase.CREATED.value
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(f"/ws/rooms/{room_id}?token={token}")
+            )
+            for token in tokens
+        ]
+        host = websockets[0]
+        host.send_json(
+            {"action": "START_GAME", "payload": {"hidden_trump_mode": False}}
+        )
+        assert receive_type(host, "ACTION_SUCCESS")["payload"]["action"] == "START_GAME"
+        assert receive_type(host, "ROOM_STATE_UPDATE")["payload"]["status"] == "IN_GAME"
+        assert (
+            receive_type(host, "GAME_STATE_UPDATE")["payload"]["phase"]
+            == GamePhase.CREATED.value
+        )
 
 
 def test_error_handling_invalid_action():
@@ -194,8 +214,16 @@ def test_start_game_uses_stored_trump_mode_and_ignores_client_override():
         ).json()["session_token"]
         for i in range(1, 5)
     ]
-    with client.websocket_connect(f"/ws/rooms/{room_id}?token={tokens[0]}") as ws:
-        ws.receive_json()
-        ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
-        assert ws.receive_json()["type"] == "ACTION_SUCCESS"
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(f"/ws/rooms/{room_id}?token={token}")
+            )
+            for token in tokens
+        ]
+        host = websockets[0]
+        host.send_json(
+            {"action": "START_GAME", "payload": {"hidden_trump_mode": False}}
+        )
+        assert receive_type(host, "ACTION_SUCCESS")["payload"]["action"] == "START_GAME"
         assert room_manager.get_room(room_id).engine.state.hidden_trump_mode is True

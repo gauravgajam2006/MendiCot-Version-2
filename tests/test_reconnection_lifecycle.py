@@ -89,6 +89,8 @@ def test_refresh_reconnect_preserves_identity_and_marks_player_online(monkeypatc
         assert player == {
             "player_id": "P1",
             "display_name": "Name P1",
+            "team_id": "TeamA",
+            "seat_index": 0,
             "is_online": True,
         }
         assert online["host_id"] == "P1"
@@ -281,4 +283,38 @@ def test_broadcast_failure_starts_grace_cleanup_and_updates_healthy_clients():
         assert routes.connection_manager.get_connection("room", "healthy") is healthy
         assert len(healthy.messages) == 2
         assert routes._get_room_state(room.room_id)["players"][0]["is_online"] is False
+    asyncio.run(run())
+
+
+def test_failed_direct_action_reply_starts_grace_cleanup():
+    async def run():
+        room = seed_room(("broken", "remaining"))
+        broken = Socket(fail_send=True)
+        remaining = Socket()
+        await reconnect("room", "broken", broken)
+        await reconnect("room", "remaining", remaining)
+        room.set_player_online("broken", True)
+
+        await routes._send_action_error(
+            "room",
+            "broken",
+            "SWITCH_TEAM",
+            "INVALID_TEAM",
+            "Invalid team.",
+        )
+
+        assert routes.connection_manager.get_connection("room", "broken") is None
+        assert room.get_player("broken").is_online is False
+        assert ("room", "broken") in routes._disconnect_cleanup_tasks
+        state = next(
+            message["payload"]
+            for message in remaining.messages
+            if message["type"] == "ROOM_STATE_UPDATE"
+        )
+        assert next(
+            player
+            for player in state["players"]
+            if player["player_id"] == "broken"
+        )["is_online"] is False
+
     asyncio.run(run())
