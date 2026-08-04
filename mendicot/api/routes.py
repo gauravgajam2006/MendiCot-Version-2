@@ -14,15 +14,30 @@ from mendicot.enums import GamePhase, Suit
 from mendicot.models import Card
 from mendicot.exceptions import (
     GameAlreadyStarted,
+    DealAlreadyCompleted,
+    DealInvariantFailed,
+    InvalidDeckDefinition,
     InvalidPhase,
+    InvalidPlayerCount,
+    InvalidSeatArrangement,
+    InvalidSeatConfiguration,
     InvalidTeam,
+    InvalidTeamConfiguration,
+    InvalidTeamName,
     MendiCotError,
     NotRoomHost,
     PlayerNotInRoom,
     PlayerOffline,
     RoomNotFound,
     RoomNotFull,
+    SetupNotActive,
     TeamsUnbalanced,
+    TeamNameTooLong,
+    ShuffleCommitmentFailed,
+    ShuffleVerificationFailed,
+    InvalidTrumpMode,
+    InvalidCardIndex,
+    NotTrumpHider,
 )
 from mendicot.room_ids import normalize_room_id
 
@@ -37,13 +52,29 @@ from .schemas import (
 )
 
 app = FastAPI(title="MendiCot API")
+
+def _get_allowed_origins() -> list[str]:
+    origins_env = os.getenv("ALLOWED_ORIGINS")
+    if origins_env:
+        origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()]
+        # Deduplicate
+        seen = set()
+        origins = [x for x in origins if not (x in seen or seen.add(x))]
+        if origins:
+            return origins
+    return ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 # Global State
 room_manager = RoomManager()
@@ -60,10 +91,79 @@ invalidated_session_tokens: Dict[str, Dict[str, str]] = {}
 DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS = float(
     os.getenv("MENDICOT_DISCONNECTED_PLAYER_GRACE_PERIOD_SECONDS", "10")
 )
+TRICK_DISPLAY_DURATION_SECONDS = float(
+    os.getenv("MENDICOT_TRICK_DISPLAY_DURATION_MS", "1800")
+) / 1000
+FINAL_SCORE_DISPLAY_DURATION_SECONDS = float(
+    os.getenv("MENDICOT_FINAL_SCORE_DISPLAY_DURATION_MS", "2500")
+) / 1000
+TRUMP_REVEAL_DISPLAY_DURATION_SECONDS = float(
+    os.getenv("MENDICOT_TRUMP_REVEAL_DURATION_MS", "1500")
+) / 1000
+HIDDEN_CARD_RETURN_DURATION_SECONDS = float(
+    os.getenv("MENDICOT_HIDDEN_CARD_RETURN_DURATION_MS", "800")
+) / 1000
 _disconnect_cleanup_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+_trick_resolution_tasks: Dict[str, asyncio.Task] = {}
+_final_score_display_tasks: Dict[str, asyncio.Task] = {}
+_trump_reveal_display_tasks: Dict[str, asyncio.Task] = {}
+_hidden_card_return_tasks: Dict[str, asyncio.Task] = {}
+
+
+def _cancel_trick_resolution(room_id: str) -> None:
+    """Cancel and forget a room's pending delayed trick resolution."""
+    room_id = normalize_room_id(room_id)
+    task = _trick_resolution_tasks.pop(room_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _cancel_final_score_display(room_id: str) -> None:
+    """Cancel and forget a room's pending final-score transition."""
+    room_id = normalize_room_id(room_id)
+    task = _final_score_display_tasks.pop(room_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _cancel_trump_reveal_display(room_id: str) -> None:
+    """Cancel and forget a room's pending trump reveal display transition."""
+    room_id = normalize_room_id(room_id)
+    task = _trump_reveal_display_tasks.pop(room_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _cancel_hidden_card_return(room_id: str) -> None:
+    """Cancel and forget a room's pending hidden card return transition."""
+    room_id = normalize_room_id(room_id)
+    task = _hidden_card_return_tasks.pop(room_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _cancel_room_lifecycle(room_id: str, _room=None) -> None:
+    _cancel_trick_resolution(room_id)
+    _cancel_final_score_display(room_id)
+    _cancel_trump_reveal_display(room_id)
+    _cancel_hidden_card_return(room_id)
+
+
+room_manager.on_room_deleted = _cancel_room_lifecycle
 
 _ACTION_ERROR_CODES = {
+    InvalidDeckDefinition: "INVALID_DECK_DEFINITION",
+    InvalidPlayerCount: "INVALID_PLAYER_COUNT",
+    InvalidSeatArrangement: "INVALID_SEAT_CONFIGURATION",
+    InvalidSeatConfiguration: "INVALID_SEAT_CONFIGURATION",
+    InvalidTeamConfiguration: "INVALID_TEAM_CONFIGURATION",
+    DealAlreadyCompleted: "DEAL_ALREADY_COMPLETED",
+    DealInvariantFailed: "DEAL_INVARIANT_FAILED",
+    ShuffleCommitmentFailed: "SHUFFLE_COMMITMENT_FAILED",
+    ShuffleVerificationFailed: "SHUFFLE_VERIFICATION_FAILED",
     InvalidTeam: "INVALID_TEAM",
+    InvalidTeamName: "INVALID_TEAM_NAME",
+    TeamNameTooLong: "TEAM_NAME_TOO_LONG",
     GameAlreadyStarted: "GAME_ALREADY_STARTED",
     PlayerNotInRoom: "PLAYER_NOT_FOUND",
     InvalidPhase: "INVALID_PHASE",
@@ -71,6 +171,10 @@ _ACTION_ERROR_CODES = {
     RoomNotFull: "ROOM_NOT_FULL",
     PlayerOffline: "PLAYER_OFFLINE",
     TeamsUnbalanced: "TEAMS_UNBALANCED",
+    SetupNotActive: "SETUP_NOT_ACTIVE",
+    InvalidTrumpMode: "INVALID_TRUMP_MODE",
+    InvalidCardIndex: "INVALID_CARD_INDEX",
+    NotTrumpHider: "NOT_TRUMP_HIDER",
 }
 
 
@@ -120,7 +224,7 @@ async def _handle_failed_direct_send(room_id: str, player_id: str) -> None:
     _schedule_disconnect_cleanup(room_id, player_id)
     await _broadcast_room_state(room_id)
     if (
-        room.status == RoomStatus.IN_GAME
+        room.status in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME)
         and connection_manager.get_connection(room_id, player_id) is None
     ):
         await connection_manager.broadcast(
@@ -191,13 +295,15 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         room = room_manager.get_room(room_id)
     except MendiCotError:
         return False
-    if room.status != RoomStatus.WAITING or player_id not in room.player_ids:
+    if room.status not in (RoomStatus.WAITING, RoomStatus.GAME_SETUP) or player_id not in room.player_ids:
         return False
     removing_host = room.host_id == player_id
     next_host_id = _next_host_id(room, player_id) if removing_host else None
     room_manager.leave_room(room_id, player_id)
     if removing_host:
         room.host_id = next_host_id
+        if room.engine is not None:
+            room.engine.state.host_id = next_host_id
     invalidate_player_tokens(room_id, player_id)
     if room.player_count == 0:
         _cancel_room_disconnect_cleanups(room_id)
@@ -206,6 +312,8 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         room_manager.delete_room(room_id)
         return True
     await _broadcast_room_state(room_id)
+    if room.status == RoomStatus.GAME_SETUP:
+        await _broadcast_game_states(room_id)
     return True
 
 
@@ -243,7 +351,7 @@ async def _handle_socket_disconnect(
         room.set_player_online(player_id, False)
         _schedule_disconnect_cleanup(room_id, player_id)
         await _broadcast_room_state(room_id)
-        if room.status == RoomStatus.IN_GAME:
+        if room.status in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME):
             await connection_manager.broadcast(
                 room_id,
                 {"type": "PLAYER_OFFLINE", "payload": {"player_id": player_id}},
@@ -363,6 +471,20 @@ def _get_room_state(room_id: str) -> dict:
         player.is_online = player.player_id in connected_players
     return room.get_state()
 
+
+def _enrich_game_view(room, view: dict) -> dict:
+    """Attach authoritative room metadata shared by every game-state snapshot."""
+    room_state = room.get_state()
+    view["room_id"] = room.room_id
+    view["room_status"] = room.status.value
+    view["host_id"] = room.host_id
+    view["current_player_id"] = view.get("current_turn")
+    view["team_names"] = room_state["team_names"]
+    if room.status == RoomStatus.GAME_SETUP:
+        view["players"] = room_state["players"]
+    return view
+
+
 async def _broadcast_room_state(room_id: str):
     room_id = normalize_room_id(room_id)
     failed_connections = await connection_manager.broadcast(
@@ -381,13 +503,14 @@ async def _broadcast_room_state(room_id: str):
 async def _broadcast_game_states(room_id: str):
     room_id = normalize_room_id(room_id)
     room = room_manager.get_room(room_id)
-    if room.status != RoomStatus.IN_GAME or room.engine is None:
+    if room.status not in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME) or room.engine is None:
         return
         
     connected_players = connection_manager.get_connected_player_ids(room_id)
     failed_players: list[str] = []
     for player_id in connected_players:
         view = room.engine.get_player_view(player_id)
+        _enrich_game_view(room, view)
         encoded_view = jsonable_encoder(view)
         delivered = await connection_manager.send_to_player(
             room_id, player_id,
@@ -399,6 +522,222 @@ async def _broadcast_game_states(room_id: str):
         _schedule_disconnect_cleanup(room_id, player_id)
     if failed_players:
         await _broadcast_room_state(room_id)
+
+
+def _schedule_trick_resolution(room_id: str) -> asyncio.Task | None:
+    """Own one delayed, generation-guarded resolution task per room."""
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        return None
+    if room.engine is None or room.engine.state.phase != GamePhase.TRICK_RESOLUTION:
+        return None
+
+    existing = _trick_resolution_tasks.get(room_id)
+    if existing is not None and not existing.done():
+        return existing
+
+    room.trick_resolution_generation += 1
+    generation = room.trick_resolution_generation
+    engine = room.engine
+    expected_version = engine.state.version
+
+    async def resolve_after_display() -> None:
+        try:
+            await asyncio.sleep(TRICK_DISPLAY_DURATION_SECONDS)
+            current_task = asyncio.current_task()
+            if _trick_resolution_tasks.get(room_id) is not current_task:
+                return
+            try:
+                current_room = room_manager.get_room(room_id)
+            except RoomNotFound:
+                return
+            if (
+                current_room is not room
+                or current_room.engine is not engine
+                or current_room.trick_resolution_generation != generation
+                or engine.state.version != expected_version
+                or engine.state.phase != GamePhase.TRICK_RESOLUTION
+            ):
+                return
+
+            engine.resolve_trick()
+            await _broadcast_game_states(room_id)
+            if engine.state.phase == GamePhase.FINAL_SCORE_DISPLAY:
+                _schedule_final_score_display(room_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _trick_resolution_tasks.get(room_id) is asyncio.current_task():
+                _trick_resolution_tasks.pop(room_id, None)
+
+    task = asyncio.create_task(resolve_after_display())
+    _trick_resolution_tasks[room_id] = task
+    return task
+
+
+def _schedule_final_score_display(room_id: str) -> asyncio.Task | None:
+    """Transition a committed final scoreboard to its terminal result once."""
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        return None
+    if (
+        room.engine is None
+        or room.engine.state.phase != GamePhase.FINAL_SCORE_DISPLAY
+    ):
+        return None
+
+    existing = _final_score_display_tasks.get(room_id)
+    if existing is not None and not existing.done():
+        return existing
+
+    room.final_score_display_generation += 1
+    generation = room.final_score_display_generation
+    trick_generation = room.trick_resolution_generation
+    engine = room.engine
+    expected_version = engine.state.version
+
+    async def transition_after_score_display() -> None:
+        try:
+            await asyncio.sleep(FINAL_SCORE_DISPLAY_DURATION_SECONDS)
+            current_task = asyncio.current_task()
+            if _final_score_display_tasks.get(room_id) is not current_task:
+                return
+            try:
+                current_room = room_manager.get_room(room_id)
+            except RoomNotFound:
+                return
+            if (
+                current_room is not room
+                or current_room.engine is not engine
+                or current_room.final_score_display_generation != generation
+                or current_room.trick_resolution_generation != trick_generation
+                or engine.state.version != expected_version
+                or engine.state.phase != GamePhase.FINAL_SCORE_DISPLAY
+            ):
+                return
+
+            engine.finalize_game()
+            await _broadcast_game_states(room_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _final_score_display_tasks.get(room_id) is asyncio.current_task():
+                _final_score_display_tasks.pop(room_id, None)
+
+    task = asyncio.create_task(transition_after_score_display())
+    _final_score_display_tasks[room_id] = task
+    return task
+
+
+def _schedule_trump_reveal_display(room_id: str) -> asyncio.Task | None:
+    """Own one delayed, generation-guarded trump reveal display task per room."""
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        return None
+    if room.engine is None or room.engine.state.phase != GamePhase.TRUMP_REVEAL_DISPLAY:
+        return None
+
+    existing = _trump_reveal_display_tasks.get(room_id)
+    if existing is not None and not existing.done():
+        return existing
+
+    room.trump_reveal_generation += 1
+    generation = room.trump_reveal_generation
+    engine = room.engine
+    expected_version = engine.state.version
+    reveal_generation = engine.state.reveal_generation
+
+    async def transition_after_reveal_display() -> None:
+        try:
+            await asyncio.sleep(TRUMP_REVEAL_DISPLAY_DURATION_SECONDS)
+            current_task = asyncio.current_task()
+            if _trump_reveal_display_tasks.get(room_id) is not current_task:
+                return
+            try:
+                current_room = room_manager.get_room(room_id)
+            except RoomNotFound:
+                return
+            if (
+                current_room is not room
+                or current_room.engine is not engine
+                or current_room.trump_reveal_generation != generation
+                or engine.state.version != expected_version
+                or engine.state.reveal_generation != reveal_generation
+                or engine.state.phase != GamePhase.TRUMP_REVEAL_DISPLAY
+            ):
+                return
+
+            engine.complete_trump_reveal_display()
+            await _broadcast_game_states(room_id)
+            _schedule_hidden_card_return(room_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _trump_reveal_display_tasks.get(room_id) is asyncio.current_task():
+                _trump_reveal_display_tasks.pop(room_id, None)
+
+    task = asyncio.create_task(transition_after_reveal_display())
+    _trump_reveal_display_tasks[room_id] = task
+    return task
+
+
+def _schedule_hidden_card_return(room_id: str) -> asyncio.Task | None:
+    """Own one delayed, generation-guarded hidden card return task per room."""
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        return None
+    if room.engine is None or room.engine.state.phase != GamePhase.HIDDEN_CARD_RETURN:
+        return None
+
+    existing = _hidden_card_return_tasks.get(room_id)
+    if existing is not None and not existing.done():
+        return existing
+
+    generation = room.trump_reveal_generation
+    engine = room.engine
+    expected_version = engine.state.version
+    reveal_generation = engine.state.reveal_generation
+
+    async def transition_after_card_return() -> None:
+        try:
+            await asyncio.sleep(HIDDEN_CARD_RETURN_DURATION_SECONDS)
+            current_task = asyncio.current_task()
+            if _hidden_card_return_tasks.get(room_id) is not current_task:
+                return
+            try:
+                current_room = room_manager.get_room(room_id)
+            except RoomNotFound:
+                return
+            if (
+                current_room is not room
+                or current_room.engine is not engine
+                or current_room.trump_reveal_generation != generation
+                or engine.state.version != expected_version
+                or engine.state.reveal_generation != reveal_generation
+                or engine.state.phase != GamePhase.HIDDEN_CARD_RETURN
+            ):
+                return
+
+            engine.complete_hidden_card_return()
+            await _broadcast_game_states(room_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _hidden_card_return_tasks.get(room_id) is asyncio.current_task():
+                _hidden_card_return_tasks.pop(room_id, None)
+
+    task = asyncio.create_task(transition_after_card_return())
+    _hidden_card_return_tasks[room_id] = task
+    return task
+
 
 @app.websocket("/ws/rooms/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
@@ -436,16 +775,27 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
         # 4 & 5. Handle initial state sync
         if room.status == RoomStatus.WAITING:
             await _broadcast_room_state(room_id)
-        elif room.status == RoomStatus.IN_GAME:
+        elif room.status in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME):
             # The room-state broadcast is the authoritative online/offline
             # transition for every client; game state remains player-specific.
             await _broadcast_room_state(room_id)
             if room.engine:
                 view = room.engine.get_player_view(player_id)
+                _enrich_game_view(room, view)
                 await connection_manager.send_to_player(
                     room_id, player_id,
                     {"type": "GAME_STATE_UPDATE", "payload": jsonable_encoder(view)}
                 )
+                if room.engine.state.phase == GamePhase.TRICK_RESOLUTION:
+                    _schedule_trick_resolution(room_id)
+                elif room.engine.state.phase == GamePhase.FINAL_SCORE_DISPLAY:
+                    _schedule_final_score_display(room_id)
+                elif room.engine.state.phase == GamePhase.TRUMP_REVEAL_DISPLAY:
+                    # Reconnect: send current state, reuse existing timer.
+                    _schedule_trump_reveal_display(room_id)
+                elif room.engine.state.phase == GamePhase.HIDDEN_CARD_RETURN:
+                    # Reconnect: send current state, reuse existing timer.
+                    _schedule_hidden_card_return(room_id)
             
             await connection_manager.broadcast(
                 room_id,
@@ -474,22 +824,26 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         else None
                     )
                     room.switch_team(player_id, team_id)
+
+                elif action == "RENAME_TEAM":
+                    name = payload.get("name") if isinstance(payload, dict) else None
+                    room.rename_team(player_id, name)
                     
                 elif action == "SELECT_TRUMP_HIDER":
-                    if room.engine is None: raise MendiCotError("Game not started.")
                     target_id = payload.get("player_id")
-                    room.engine.select_trump_hider(player_id, target_id)
+                    room.select_trump_hider(player_id, target_id)
                     
                 elif action == "SELECT_FIRST_PLAYER":
-                    if room.engine is None: raise MendiCotError("Game not started.")
                     target_id = payload.get("player_id")
-                    room.engine.select_first_player(player_id, target_id)
+                    room.select_first_player(player_id, target_id)
+
+                elif action == "CANCEL_GAME_SETUP":
+                    room.cancel_game_setup(player_id)
                     
                 elif action == "DEAL_CARDS":
-                    if room.engine is None: raise MendiCotError("Game not started.")
-                    if player_id != room.host_id:
-                        raise MendiCotError("Only host can deal cards.")
-                    room.engine.deal_cards()
+                    raise InvalidPhase(
+                        "Cards are dealt only by the authoritative setup lifecycle."
+                    )
                     
                 elif action == "SELECT_HIDDEN_TRUMP":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -498,9 +852,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     
                 elif action == "COMPLETE_TRUMP_SETUP":
                     if room.engine is None: raise MendiCotError("Game not started.")
-                    if player_id != room.engine.state.trump_state.trump_hider_id:
-                        raise MendiCotError("Not the selected trump hider.")
-                    room.engine.complete_hidden_trump_setup()
+                    room.engine.complete_hidden_trump_setup(player_id)
                     
                 elif action == "PLAY_CARD":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -515,8 +867,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     room.engine.reveal_trump(player_id)
                     
                 elif action == "RESOLVE_TRICK":
-                    if room.engine is None: raise MendiCotError("Game not started.")
-                    room.engine.resolve_trick()
+                    raise InvalidPhase(
+                        "Tricks resolve automatically after the display window."
+                    )
                     
                 elif action == "LEAVE_ROOM":
                     if room.status != RoomStatus.WAITING:
@@ -559,10 +912,32 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     await _handle_failed_direct_send(room_id, player_id)
                 
                 # Broadcast state updates
-                if delivered and action in ("START_GAME", "SWITCH_TEAM"):
+                if delivered and action in (
+                    "START_GAME",
+                    "SWITCH_TEAM",
+                    "RENAME_TEAM",
+                    "CANCEL_GAME_SETUP",
+                    "SELECT_FIRST_PLAYER",
+                ):
                     await _broadcast_room_state(room_id)
-                if room.status == RoomStatus.IN_GAME:
+                if room.status in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME):
                     await _broadcast_game_states(room_id)
+                if (
+                    action == "PLAY_CARD"
+                    and room.engine is not None
+                    and room.engine.state.phase == GamePhase.TRICK_RESOLUTION
+                ):
+                    # Start the timer only after every connected client has been
+                    # sent the completed-trick snapshot.
+                    _schedule_trick_resolution(room_id)
+                if (
+                    action == "REVEAL_TRUMP"
+                    and room.engine is not None
+                    and room.engine.state.phase == GamePhase.TRUMP_REVEAL_DISPLAY
+                ):
+                    # Start the reveal display timer after all clients receive
+                    # the TRUMP_REVEAL_DISPLAY snapshot.
+                    _schedule_trump_reveal_display(room_id)
                     
             except MendiCotError as e:
                 await _send_action_error(

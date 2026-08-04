@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.env
+.coverage
+htmlcov/
 .venv/
 venv/
+.env
+.env.*
+!.env.example

@@ -325,7 +325,7 @@ def test_balanced_full_online_room_starts_successfully(player_count):
 
     room = routes.room_manager.get_room(room_id)
     assert success["payload"]["action"] == "START_GAME"
-    assert room.status.value == "IN_GAME"
+    assert room.status.value == "GAME_SETUP"
     assert room.engine.state.player_count == player_count
     assert {
         team_id: len(team.player_ids)

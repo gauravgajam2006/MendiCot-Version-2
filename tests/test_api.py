@@ -144,10 +144,10 @@ def test_start_game_flow():
             {"action": "START_GAME", "payload": {"hidden_trump_mode": False}}
         )
         assert receive_type(host, "ACTION_SUCCESS")["payload"]["action"] == "START_GAME"
-        assert receive_type(host, "ROOM_STATE_UPDATE")["payload"]["status"] == "IN_GAME"
+        assert receive_type(host, "ROOM_STATE_UPDATE")["payload"]["status"] == "GAME_SETUP"
         assert (
             receive_type(host, "GAME_STATE_UPDATE")["payload"]["phase"]
-            == GamePhase.CREATED.value
+            == GamePhase.FIRST_PLAYER_SELECTION.value
         )
 
 

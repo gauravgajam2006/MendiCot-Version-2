@@ -72,6 +72,8 @@ def test_full_game_4_players(four_players, engine):
                         
             engine.play_card(player_id, valid_card)
     
+    assert state.phase == "FINAL_SCORE_DISPLAY"
+    engine.finalize_game()
     assert state.phase in ("GAME_OVER", "DRAW")
     
     total_tricks = state.teams["TeamA"].tricks_won + state.teams["TeamB"].tricks_won

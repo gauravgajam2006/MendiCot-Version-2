@@ -50,6 +50,30 @@ class MustPlayTrump(MendiCotError):
     def __init__(self, message="Player must play a trump card."):
         super().__init__(message)
 
+class InvalidDeckDefinition(MendiCotError):
+    def __init__(self, message="Canonical deck definition is invalid."):
+        super().__init__(message)
+
+class InvalidSeatConfiguration(MendiCotError):
+    def __init__(self, message="Authoritative seat configuration is invalid."):
+        super().__init__(message)
+
+class DealAlreadyCompleted(MendiCotError):
+    def __init__(self, message="Cards have already been dealt for this game."):
+        super().__init__(message)
+
+class DealInvariantFailed(MendiCotError):
+    def __init__(self, message="Authoritative deal validation failed."):
+        super().__init__(message)
+
+class ShuffleCommitmentFailed(MendiCotError):
+    def __init__(self, message="Shuffle commitment could not be created."):
+        super().__init__(message)
+
+class ShuffleVerificationFailed(MendiCotError):
+    def __init__(self, message="Shuffle audit verification failed."):
+        super().__init__(message)
+
 class RoomError(MendiCotError):
     """Base exception for room management errors."""
 
@@ -71,7 +95,7 @@ class GameAlreadyStarted(RoomError):
 class InvalidRoomSize(RoomError):
     """Raised when trying to start with an invalid player count."""
 
-class NotRoomHost(RoomError):
+class NotRoomHost(RoomError, PermissionError):
     """Raised when a non-host attempts a host-only action."""
 
 class PlayerNotInRoom(RoomError):
@@ -79,6 +103,12 @@ class PlayerNotInRoom(RoomError):
 
 class InvalidTeam(RoomError):
     """Raised when a lobby team ID is not supported."""
+
+class InvalidTeamName(RoomError):
+    """Raised when a team display name is missing or contains unsafe characters."""
+
+class TeamNameTooLong(RoomError):
+    """Raised when a team display name exceeds the supported length."""
 
 class RoomNotFull(RoomError):
     """Raised when starting before the configured room capacity is reached."""
@@ -88,3 +118,24 @@ class PlayerOffline(RoomError):
 
 class TeamsUnbalanced(RoomError):
     """Raised when lobby teams are invalid or are not equally sized."""
+
+class SetupNotActive(RoomError):
+    """Raised when no cancellable pre-game setup is active."""
+
+
+class InvalidTrumpMode(MendiCotError):
+    """Raised when an action is incompatible with the active trump mode."""
+    def __init__(self, message="Action is not valid for the current trump mode."):
+        super().__init__(message)
+
+
+class InvalidCardIndex(MendiCotError):
+    """Raised when a card index is missing, malformed, or out of range."""
+    def __init__(self, message="Card index is invalid."):
+        super().__init__(message)
+
+
+class NotTrumpHider(MendiCotError):
+    """Raised when a non-hider attempts a hider-only trump action."""
+    def __init__(self, message="Only the selected trump hider can perform this action."):
+        super().__init__(message)

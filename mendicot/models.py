@@ -31,6 +31,7 @@ class Player:
     player_id: str
     team_id: str
     seat_index: int
+    display_name: str | None = None
 
 @dataclass
 class Team:
@@ -80,3 +81,15 @@ class GameState:
     trump_state: TrumpState = field(default_factory=TrumpState)
     version: int = 0
     hidden_trump_mode: bool = False
+    # GAME_STATE_UPDATE contract: stable team ID -> canonically ordered ten suits.
+    captured_mendis: dict[str, list[Suit]] = field(default_factory=dict)
+    # FINAL_SCORE_DISPLAY/GAME_OVER/DRAW contract: winning team ID or "DRAW".
+    final_result: str | None = None
+    dealt: bool = False
+    deal_generation: int = 0
+    reveal_generation: int = 0
+    configuration_locked: bool = False
+    deck_definition_version: str | None = None
+    shuffle_algorithm_version: str | None = None
+    dealing_algorithm_version: str | None = None
+    shuffle_commitment: str | None = None

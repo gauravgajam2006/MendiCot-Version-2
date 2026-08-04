@@ -1,4 +1,7 @@
+import copy
 import enum
+import threading
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,16 +15,22 @@ from .exceptions import (
     GameAlreadyStarted,
     PlayerNotInRoom,
     InvalidRoomSize,
+    InvalidPhase,
     NotRoomHost,
     InvalidTeam,
+    InvalidTeamName,
+    TeamNameTooLong,
     PlayerOffline,
     RoomNotFull,
     TeamsUnbalanced,
+    SetupNotActive,
+    InvalidTrumpMode,
 )
 
 
 class RoomStatus(str, enum.Enum):
     WAITING = "WAITING"
+    GAME_SETUP = "GAME_SETUP"
     IN_GAME = "IN_GAME"
 
 
@@ -39,6 +48,11 @@ class GameRoom:
 
     MAX_PLAYERS = 8
     VALID_START_COUNTS = (4, 6, 8)
+    MAX_TEAM_NAME_LENGTH = 24
+    DEFAULT_TEAM_NAMES = {
+        TeamId.TEAM_A: "Team Maroon",
+        TeamId.TEAM_B: "Team Gold",
+    }
 
     def __init__(
         self,
@@ -53,7 +67,12 @@ class GameRoom:
         self._players: list[RoomPlayer] = []
         self._next_join_index = 0
         self._status = RoomStatus.WAITING
+        self.team_names: dict[TeamId, str] = dict(self.DEFAULT_TEAM_NAMES)
         self.engine: Optional[MendiCotEngine] = None
+        self.trick_resolution_generation = 0
+        self.final_score_display_generation = 0
+        self.trump_reveal_generation = 0
+        self._setup_lock = threading.RLock()
 
     @property
     def player_ids(self) -> list[str]:
@@ -85,7 +104,15 @@ class GameRoom:
         return player
 
     def add_player(self, player_id: str, display_name: Optional[str] = None) -> None:
-        if self._status == RoomStatus.IN_GAME:
+        with self._setup_lock:
+            self._add_player_locked(player_id, display_name)
+
+    def _add_player_locked(
+        self,
+        player_id: str,
+        display_name: Optional[str] = None,
+    ) -> None:
+        if self._status != RoomStatus.WAITING:
             raise GameAlreadyStarted("Cannot join room after the game has started.")
         
         if player_id in self.player_ids:
@@ -114,6 +141,10 @@ class GameRoom:
             self.host_id = player_id
 
     def remove_player(self, player_id: str) -> None:
+        with self._setup_lock:
+            self._remove_player_locked(player_id)
+
+    def _remove_player_locked(self, player_id: str) -> None:
         if player_id not in self.player_ids:
             raise PlayerNotInRoom(f"Player {player_id} not found in the room.")
         
@@ -133,7 +164,11 @@ class GameRoom:
         self.get_player(player_id).is_online = is_online
 
     def switch_team(self, player_id: str, team_id: str | None) -> None:
-        if self._status == RoomStatus.IN_GAME:
+        with self._setup_lock:
+            self._switch_team_locked(player_id, team_id)
+
+    def _switch_team_locked(self, player_id: str, team_id: str | None) -> None:
+        if self._status != RoomStatus.WAITING:
             raise GameAlreadyStarted("Cannot switch teams after the game has started.")
 
         try:
@@ -145,6 +180,38 @@ class GameRoom:
 
         # Assigning the existing value is intentionally idempotent.
         self.get_player(player_id).team_id = requested_team
+
+    def rename_team(self, player_id: str, name: object) -> str:
+        with self._setup_lock:
+            return self._rename_team_locked(player_id, name)
+
+    def _rename_team_locked(self, player_id: str, name: object) -> str:
+        """Rename the requesting player's current team while in the lobby."""
+        if self._status != RoomStatus.WAITING:
+            raise InvalidPhase("Teams can only be renamed while waiting in the lobby.")
+
+        player = self.get_player(player_id)
+        if not isinstance(name, str):
+            raise InvalidTeamName("Team name must be a string.")
+
+        if any(
+            unicodedata.category(character).startswith("C")
+            for character in name
+        ):
+            raise InvalidTeamName("Team name cannot contain control characters.")
+
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise InvalidTeamName("Team name cannot be empty.")
+        if len(normalized_name) > self.MAX_TEAM_NAME_LENGTH:
+            raise TeamNameTooLong(
+                f"Team name cannot exceed {self.MAX_TEAM_NAME_LENGTH} characters."
+            )
+
+        team_id = TeamId(player.team_id)
+        # Reassigning the same value is intentionally idempotent.
+        self.team_names[team_id] = normalized_name
+        return normalized_name
 
     def _validate_teams_for_start(self) -> None:
         team_counts = {team_id: 0 for team_id in TeamId}
@@ -189,6 +256,7 @@ class GameRoom:
                 player_id=room_player.player_id,
                 team_id=TeamId(room_player.team_id).value,
                 seat_index=engine_seat_index,
+                display_name=room_player.display_name,
             )
             for engine_seat_index, room_player in enumerate(engine_order)
         ]
@@ -198,11 +266,19 @@ class GameRoom:
         requester_id: str,
         online_player_ids: set[str] | None = None,
     ) -> None:
+        with self._setup_lock:
+            self._start_game_locked(requester_id, online_player_ids)
+
+    def _start_game_locked(
+        self,
+        requester_id: str,
+        online_player_ids: set[str] | None = None,
+    ) -> None:
         if requester_id != self.host_id:
             raise NotRoomHost("Only the room host can start the game.")
         
-        if self._status == RoomStatus.IN_GAME:
-            raise GameAlreadyStarted("The game has already started.")
+        if self._status != RoomStatus.WAITING:
+            raise GameAlreadyStarted("Game setup or gameplay is already active.")
             
         if self.configured_player_count not in self.VALID_START_COUNTS:
             raise InvalidRoomSize(
@@ -235,9 +311,73 @@ class GameRoom:
             game_id=self.room_id,
             players=self._build_engine_players(),
             host_id=self.host_id,
-            hidden_trump_mode=self.trump_mode == "hidden"
+            hidden_trump_mode=self.trump_mode == "hidden",
+            room_id=self.room_id,
         )
         self.engine = engine
+        self.engine.begin_first_player_selection()
+        self._status = RoomStatus.GAME_SETUP
+
+    def cancel_game_setup(self, requester_id: str) -> None:
+        with self._setup_lock:
+            self._cancel_game_setup_locked(requester_id)
+
+    def _cancel_game_setup_locked(self, requester_id: str) -> None:
+        if requester_id != self.host_id:
+            raise NotRoomHost("Only the room host can cancel game setup.")
+        if self._status == RoomStatus.WAITING:
+            raise SetupNotActive("No game setup is active.")
+        if self._status != RoomStatus.GAME_SETUP:
+            raise InvalidPhase("Game setup can only be cancelled before gameplay.")
+
+        self.engine = None
+        self._status = RoomStatus.WAITING
+
+    def select_trump_hider(self, requester_id: str, player_id: str) -> None:
+        with self._setup_lock:
+            if self.trump_mode != "hidden":
+                raise InvalidTrumpMode(
+                    "SELECT_TRUMP_HIDER is only valid in hidden trump mode."
+                )
+            if self._status != RoomStatus.GAME_SETUP or self.engine is None:
+                raise SetupNotActive("No game setup is active.")
+            self.engine.select_trump_hider(requester_id, player_id)
+
+    def select_first_player(self, requester_id: str, player_id: str) -> None:
+        with self._setup_lock:
+            self._select_first_player_locked(requester_id, player_id)
+
+    def _select_first_player_locked(
+        self,
+        requester_id: str,
+        player_id: str,
+    ) -> None:
+        if requester_id != self.host_id:
+            raise NotRoomHost("Only the room host can select the first player.")
+        if self._status != RoomStatus.GAME_SETUP:
+            raise InvalidPhase(
+                "First-player selection is only available during game setup."
+            )
+        if self.engine is None:
+            raise SetupNotActive("No game setup is active.")
+        if self.player_count != self.configured_player_count:
+            raise RoomNotFull(
+                f"Room requires {self.configured_player_count} players before completing setup."
+            )
+
+        self._validate_teams_for_start()
+
+        self.get_player(player_id)
+        previous_state = copy.deepcopy(self.engine.state)
+        try:
+            self.engine.select_first_player(requester_id, player_id)
+            self.engine.deal_cards()
+        except Exception:
+            # Selecting a first player moves the engine through its internal
+            # CREATED construction phase. Never expose that partial state if
+            # dealing or phase advancement fails.
+            self.engine.state = previous_state
+            raise
         self._status = RoomStatus.IN_GAME
 
     def get_state(self) -> dict:
@@ -247,6 +387,9 @@ class GameRoom:
             "host_id": self.host_id,
             "player_count": self.configured_player_count,
             "trump_mode": self.trump_mode,
+            "team_names": {
+                team_id.value: self.team_names[team_id] for team_id in TeamId
+            },
             "players": [
                 {
                     "player_id": p.player_id,

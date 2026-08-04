@@ -320,9 +320,10 @@ def test_normal_trump_first_cut_sets_trump(
 
 
 @pytest.mark.parametrize("player_count", [6, 8])
-def test_hidden_trump_auto_reveals_on_cut_with_trump(
+def test_hidden_trump_does_not_auto_reveal_on_cut_with_trump(
     engine, six_players, eight_players, player_count
 ):
+    """Auto-reveal removed: playing on cut with trump does not reveal."""
     players = _get_players(six_players, eight_players, player_count)
 
     engine.create_game(
@@ -350,13 +351,14 @@ def test_hidden_trump_auto_reveals_on_cut_with_trump(
     next_pid = state.seat_order[(state.seat_order.index(leader) + 1) % player_count]
 
     state.hands[leader] = [Card(Suit.HEARTS, Rank.ACE)]
-    # Next player has no HEARTS but has CLUBS (trump) → auto-reveal
+    # Next player has no HEARTS but has CLUBS (trump) — no auto-reveal.
     state.hands[next_pid] = [Card(Suit.CLUBS, Rank.KING)]
 
     engine.play_card(leader, Card(Suit.HEARTS, Rank.ACE))
     engine.play_card(next_pid, Card(Suit.CLUBS, Rank.KING))
 
-    assert state.trump_state.status == TrumpStatus.PUBLIC
+    # Auto-reveal removed: trump stays HIDDEN.
+    assert state.trump_state.status == TrumpStatus.HIDDEN
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +384,8 @@ def test_full_game_reaches_game_over_or_draw(
             card = _find_valid_card(hand, state.current_trick, state.trump_state)
             engine.play_card(pid, card)
 
+    assert state.phase == GamePhase.FINAL_SCORE_DISPLAY
+    engine.finalize_game()
     assert state.phase in (GamePhase.GAME_OVER, GamePhase.DRAW)
 
     total_tricks = (

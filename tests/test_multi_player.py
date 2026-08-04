@@ -63,7 +63,8 @@ def test_host_can_select_trump_hider_and_first_player(engine, six_players, eight
     engine.create_game(
         f"game_host_select_{player_count}p",
         players,
-        host_id=players[0].player_id
+        host_id=players[0].player_id,
+        hidden_trump_mode=True,
     )
 
     hider_id = players[2].player_id

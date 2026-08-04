@@ -114,7 +114,7 @@ def test_only_host_can_start_game():
 
     mark_all_online(room)
     room.start_game("P1")
-    assert room.status == RoomStatus.IN_GAME
+    assert room.status == RoomStatus.GAME_SETUP
 
 def test_cannot_start_with_invalid_player_count():
     room = GameRoom("test_room", configured_player_count=3)
@@ -130,19 +130,19 @@ def test_can_start_with_valid_player_counts():
     for i in range(1, 5): room_4.add_player(f"P{i}")
     mark_all_online(room_4)
     room_4.start_game("P1")
-    assert room_4.status == RoomStatus.IN_GAME
+    assert room_4.status == RoomStatus.GAME_SETUP
 
     room_6 = GameRoom("room_6", configured_player_count=6)
     for i in range(1, 7): room_6.add_player(f"P{i}")
     mark_all_online(room_6)
     room_6.start_game("P1")
-    assert room_6.status == RoomStatus.IN_GAME
+    assert room_6.status == RoomStatus.GAME_SETUP
 
     room_8 = GameRoom("room_8")
     for i in range(1, 9): room_8.add_player(f"P{i}")
     mark_all_online(room_8)
     room_8.start_game("P1")
-    assert room_8.status == RoomStatus.IN_GAME
+    assert room_8.status == RoomStatus.GAME_SETUP
 
 def test_game_cannot_start_twice():
     room = GameRoom("test_room", configured_player_count=4)
@@ -151,6 +151,7 @@ def test_game_cannot_start_twice():
 
     mark_all_online(room)
     room.start_game("P1")
+    room.select_first_player("P1", "P1")
     
     with pytest.raises(GameAlreadyStarted):
         room.start_game("P1")
@@ -162,6 +163,7 @@ def test_players_cannot_join_after_game_starts():
 
     mark_all_online(room)
     room.start_game("P1")
+    room.select_first_player("P1", "P1")
     
     with pytest.raises(GameAlreadyStarted):
         room.add_player("P5")
@@ -173,6 +175,7 @@ def test_players_cannot_leave_after_game_starts():
 
     mark_all_online(room)
     room.start_game("P1")
+    room.select_first_player("P1", "P1")
     
     with pytest.raises(GameAlreadyStarted):
         room.remove_player("P1")
@@ -247,6 +250,7 @@ def test_engine_isolation():
     mark_all_online(room_b)
     room_a.start_game("A1")
     room_b.start_game("B1")
+    room_a.select_first_player("A1", "A1")
     
     # Verify engines are distinct
     assert room_a.engine is not room_b.engine
@@ -262,7 +266,6 @@ def test_engine_isolation():
     assert state_a.host_id == "A1"
     assert state_b.host_id == "B1"
     
-    # Check that modifying Room A does not affect Room B
-    room_a.engine.deal_cards()
+    # Completing Room A setup does not affect Room B.
     assert state_a.phase == GamePhase.PLAYING
-    assert state_b.phase == GamePhase.CREATED
+    assert state_b.phase == GamePhase.FIRST_PLAYER_SELECTION

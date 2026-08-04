@@ -1,12 +1,14 @@
 import pytest
 from mendicot.enums import GamePhase
+from mendicot.exceptions import InvalidPhase
 
 
 def test_host_can_select_trump_hider(engine, four_players):
     engine.create_game(
         "game_setup",
         four_players,
-        host_id=four_players[0].player_id
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True,
     )
 
     state = engine.select_trump_hider(
@@ -22,7 +24,8 @@ def test_non_host_cannot_select_trump_hider(engine, four_players):
     engine.create_game(
         "game_setup",
         four_players,
-        host_id=four_players[0].player_id
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True,
     )
 
     with pytest.raises(PermissionError):
@@ -65,7 +68,8 @@ def test_invalid_player_id_select_trump_hider(engine, four_players):
     engine.create_game(
         "game_setup",
         four_players,
-        host_id=four_players[0].player_id
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True,
     )
 
     with pytest.raises(ValueError, match="Player not in game"):
@@ -82,6 +86,7 @@ def test_invalid_player_id_select_trump_hider_in_phase(engine, four_players):
         host_id=four_players[0].player_id,
         hidden_trump_mode=True
     )
+    engine.select_trump_hider("P1", "P1")
     engine.deal_cards()
 
     with pytest.raises(ValueError, match="Player not in game"):
@@ -106,7 +111,8 @@ def test_host_selection_of_trump_hider_updates_state(engine, four_players):
     engine.create_game(
         "game_setup",
         four_players,
-        host_id=four_players[0].player_id
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True,
     )
 
     state = engine.select_trump_hider(
@@ -167,9 +173,22 @@ def test_hidden_trump_mode_enters_hidden_trump_selection_after_dealing(engine, f
         host_id=four_players[0].player_id,
         hidden_trump_mode=True
     )
+    engine.select_trump_hider("P1", "P2")
     state = engine.deal_cards()
 
     assert state.phase == GamePhase.HIDDEN_TRUMP_SELECTION
+
+
+def test_hidden_trump_deal_requires_a_precommitted_hider(engine, four_players):
+    engine.create_game(
+        "game_setup",
+        four_players,
+        host_id=four_players[0].player_id,
+        hidden_trump_mode=True,
+    )
+
+    with pytest.raises(InvalidPhase, match="must be selected before dealing"):
+        engine.deal_cards()
 
 
 def test_hidden_trump_mode_selected_hider_can_select_card(engine, four_players):

@@ -1,5 +1,5 @@
-import random
 from mendicot.deck import create_deck, shuffle_deck
+from mendicot.secure_shuffle import HmacSha256Random
 from mendicot.enums import Suit, Rank
 
 def test_deck_has_48_cards():
@@ -31,8 +31,8 @@ def test_shuffle_is_deterministic_with_rng():
     deck1 = create_deck()
     deck2 = create_deck()
     
-    rng1 = random.Random(42)
-    rng2 = random.Random(42)
+    rng1 = HmacSha256Random(b"a" * 32)
+    rng2 = HmacSha256Random(b"a" * 32)
     
     shuffled1 = shuffle_deck(deck1, rng1)
     shuffled2 = shuffle_deck(deck2, rng2)
@@ -41,7 +41,7 @@ def test_shuffle_is_deterministic_with_rng():
 
 def test_shuffle_produces_different_order():
     deck = create_deck()
-    rng = random.Random(42)
+    rng = HmacSha256Random(b"b" * 32)
     shuffled = shuffle_deck(list(deck), rng)
     
     assert deck != shuffled

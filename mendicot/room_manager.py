@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 from .room import GameRoom
 from .exceptions import RoomAlreadyExists, RoomNotFound
 from .room_ids import normalize_room_id
@@ -8,6 +8,7 @@ class RoomManager:
 
     def __init__(self):
         self._rooms: dict[str, GameRoom] = {}
+        self.on_room_deleted: Callable[[str, GameRoom], None] | None = None
 
     def create_room(
         self,
@@ -33,7 +34,9 @@ class RoomManager:
         room_id = normalize_room_id(room_id)
         if room_id not in self._rooms:
             raise RoomNotFound(f"Room {room_id} does not exist.")
-        del self._rooms[room_id]
+        room = self._rooms.pop(room_id)
+        if self.on_room_deleted is not None:
+            self.on_room_deleted(room_id, room)
 
     def join_room(self, room_id: str, player_id: str, display_name: Optional[str] = None) -> None:
         room = self.get_room(normalize_room_id(room_id))

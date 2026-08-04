@@ -1,11 +1,11 @@
 import pytest
-import random
+from mendicot.secure_shuffle import DeterministicEntropySource
 from mendicot.models import Player
 from mendicot.engine import MendiCotEngine
 
 @pytest.fixture
-def rng():
-    return random.Random(42)
+def entropy_source():
+    return DeterministicEntropySource(b"mendicot-test-suite-seed")
 
 @pytest.fixture
 def four_players():
@@ -41,8 +41,8 @@ def eight_players():
     ]
 
 @pytest.fixture
-def engine(rng):
-    return MendiCotEngine(rng=rng)
+def engine(entropy_source):
+    return MendiCotEngine(entropy_source=entropy_source)
 
 @pytest.fixture
 def game_state_4p(engine, four_players):

@@ -1,9 +1,10 @@
-from .enums import Suit, TrumpStatus
+from .enums import Suit, TeamId, TrumpStatus
 from .models import Player, Card, TrumpState
 from .exceptions import (
     InvalidPlayerCount,
     InvalidTeamConfiguration,
     InvalidSeatArrangement,
+    InvalidSeatConfiguration,
     MustFollowSuit,
     MustPlayTrump,
     CardNotOwned
@@ -18,7 +19,7 @@ def validate_team_configuration(players: list[Player]) -> None:
     for player in players:
         team_counts[player.team_id] = team_counts.get(player.team_id, 0) + 1
     
-    if len(team_counts) != 2:
+    if set(team_counts) != {TeamId.TEAM_A.value, TeamId.TEAM_B.value}:
         raise InvalidTeamConfiguration()
     
     counts = list(team_counts.values())
@@ -26,8 +27,24 @@ def validate_team_configuration(players: list[Player]) -> None:
         raise InvalidTeamConfiguration()
 
 def validate_seating(players: list[Player]) -> None:
+    num_players = len(players)
+    player_ids = [player.player_id for player in players]
+    seat_indexes = [player.seat_index for player in players]
+    if len(set(player_ids)) != num_players:
+        raise InvalidSeatConfiguration("Player IDs must be unique.")
+    if any(
+        not isinstance(seat_index, int) or isinstance(seat_index, bool)
+        for seat_index in seat_indexes
+    ):
+        raise InvalidSeatConfiguration("Seat indexes must be integers.")
+    if len(set(seat_indexes)) != num_players:
+        raise InvalidSeatConfiguration("Seat indexes must be unique.")
+    if set(seat_indexes) != set(range(num_players)):
+        raise InvalidSeatConfiguration(
+            "Seat indexes must form the complete zero-based range."
+        )
+
     sorted_players = sorted(players, key=lambda p: p.seat_index)
-    num_players = len(sorted_players)
     for i in range(num_players):
         current_team = sorted_players[i].team_id
         next_team = sorted_players[(i + 1) % num_players].team_id

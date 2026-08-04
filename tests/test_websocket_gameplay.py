@@ -4,14 +4,16 @@ from typing import List, Dict
 from contextlib import ExitStack
 import time
 
+from mendicot.api import routes
 from mendicot.api.routes import app, room_manager, connection_manager, session_tokens
 from mendicot.enums import GamePhase, Suit
 
 client = TestClient(app)
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
     """Reset global state before each test."""
+    monkeypatch.setattr(routes, "TRICK_DISPLAY_DURATION_SECONDS", 0.01)
     room_manager._rooms.clear()
     connection_manager.active_connections.clear()
     session_tokens.clear()
@@ -147,8 +149,8 @@ def test_ws_host_permissions():
         # Non-host tries DEAL_CARDS
         non_host_ws.send_json({"action": "DEAL_CARDS"})
         err = wait_for_message(non_host_ws, "ERROR")
-        assert err["payload"]["code"] == "MendiCotError"
-        assert "Only host can deal cards" in err["payload"]["message"]
+        assert err["payload"]["code"] == "INVALID_PHASE"
+        assert "authoritative setup lifecycle" in err["payload"]["message"]
 
 # --- 4. NORMAL TRUMP MODE OVER WEBSOCKET ---
 def test_ws_normal_trump_gameplay():
@@ -169,10 +171,6 @@ def test_ws_normal_trump_gameplay():
         host_ws.send_json({"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": players[0]["player_id"]}})
         wait_for_message(host_ws, "ACTION_SUCCESS")
 
-        # DEAL CARDS
-        host_ws.send_json({"action": "DEAL_CARDS"})
-        wait_for_message(host_ws, "ACTION_SUCCESS")
-        
         hands = []
         for i, ws in enumerate(websockets):
             update = wait_for_game_phase(ws, GamePhase.PLAYING)
@@ -199,11 +197,18 @@ def test_ws_normal_trump_gameplay():
             websockets[i].send_json({"action": "PLAY_CARD", "payload": {"suit": valid_card["suit"], "rank": valid_card["rank"]}})
             wait_for_message(websockets[i], "ACTION_SUCCESS")
                 
-        # Resolve trick
-        host_ws.send_json({"action": "RESOLVE_TRICK"})
-        wait_for_message(host_ws, "ACTION_SUCCESS")
-        
-        # Verify trick resolved and back to playing
+        # Every player sees the complete trick before automatic resolution.
+        for ws in websockets:
+            resolving = wait_for_game_phase(ws, GamePhase.TRICK_RESOLUTION)
+            assert len(resolving["payload"]["current_trick"]["played_cards"]) == 4
+            assert resolving["payload"]["current_trick_leader"] is not None
+            assert (
+                resolving["payload"]["current_trick"]["winner_player_id"]
+                == resolving["payload"]["current_trick_leader"]["player_id"]
+            )
+            assert resolving["payload"]["current_trick"]["completed"] is True
+
+        # Verify the backend resolves and returns to playing without a client action.
         for ws in websockets:
             # First wait for the SUCCESS or state update
             # We can wait for GAME_STATE_UPDATE where current_trick is empty
@@ -213,6 +218,108 @@ def test_ws_normal_trump_gameplay():
                     break
             else:
                 pytest.fail("Did not receive resolved trick state")
+
+
+def test_game_state_update_contains_authoritative_current_trick_leader():
+    room_id, players = setup_room_with_players(4)
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        host_ws = websockets[0]
+        host_ws.send_json({"action": "START_GAME"})
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+        host_ws.send_json({
+            "action": "SELECT_FIRST_PLAYER",
+            "payload": {"player_id": players[0]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        hands = []
+        for index, websocket in enumerate(websockets):
+            update = wait_for_game_phase(websocket, GamePhase.PLAYING)
+            assert update["payload"]["current_trick_leader"] is None
+            hands.append(update["payload"]["hands"][players[index]["player_id"]])
+
+        first_card = hands[0][0]
+        host_ws.send_json({
+            "action": "PLAY_CARD",
+            "payload": first_card,
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        expected = {
+            "player_id": players[0]["player_id"],
+            "display_name": "Player 1",
+            "card": first_card,
+        }
+        for websocket in websockets:
+            update = wait_for_message(websocket, "GAME_STATE_UPDATE")
+            assert update["payload"]["current_trick_leader"] == expected
+
+
+def test_reconnect_during_resolution_receives_complete_trick_and_manual_resolve_is_rejected(
+    monkeypatch,
+):
+    monkeypatch.setattr(routes, "TRICK_DISPLAY_DURATION_SECONDS", 0.25)
+    room_id, players = setup_room_with_players(4)
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={player['session_token']}"
+                )
+            )
+            for player in players
+        ]
+        host_ws = websockets[0]
+        host_ws.send_json({"action": "START_GAME"})
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+        host_ws.send_json({
+            "action": "SELECT_FIRST_PLAYER",
+            "payload": {"player_id": players[0]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        hands = []
+        for index, websocket in enumerate(websockets):
+            update = wait_for_game_phase(websocket, GamePhase.PLAYING)
+            hands.append(update["payload"]["hands"][players[index]["player_id"]])
+
+        lead_suit = hands[0][0]["suit"]
+        for index, websocket in enumerate(websockets):
+            card = next(
+                (candidate for candidate in hands[index] if candidate["suit"] == lead_suit),
+                hands[index][0],
+            )
+            websocket.send_json({"action": "PLAY_CARD", "payload": card})
+            wait_for_message(websocket, "ACTION_SUCCESS")
+
+        resolving = wait_for_game_phase(host_ws, GamePhase.TRICK_RESOLUTION)
+        assert len(resolving["payload"]["current_trick"]["played_cards"]) == 4
+        assert resolving["payload"]["current_trick_leader"] is not None
+
+        host_ws.send_json({"action": "RESOLVE_TRICK"})
+        error = wait_for_message(host_ws, "ERROR")
+        assert error["payload"]["code"] == "INVALID_PHASE"
+
+        websockets[1].close()
+        with client.websocket_connect(
+            f"/ws/rooms/{room_id}?token={players[1]['session_token']}"
+        ) as reconnected:
+            update = wait_for_game_phase(reconnected, GamePhase.TRICK_RESOLUTION)
+            assert len(update["payload"]["current_trick"]["played_cards"]) == 4
+            assert update["payload"]["current_trick_leader"] is not None
+            assert sum(
+                team["tricks_won"] for team in update["payload"]["teams"].values()
+            ) == 0
 
 # --- 5. HIDDEN TRUMP MODE OVER WEBSOCKET ---
 @pytest.mark.parametrize("num_players", [4, 6, 8])
@@ -247,10 +354,6 @@ def test_ws_hidden_trump_lifecycle(num_players):
         )
         wait_for_message(host_ws, "ACTION_SUCCESS")
             
-        # DEAL CARDS
-        host_ws.send_json({"action": "DEAL_CARDS"})
-        wait_for_message(host_ws, "ACTION_SUCCESS")
-        
         for ws in [host_ws, hider_ws, p3_ws]: 
             wait_for_game_phase(ws, GamePhase.HIDDEN_TRUMP_SELECTION)
             
@@ -282,8 +385,10 @@ def test_ws_multiplayer_gameplay_6p():
         host_ws = websockets[0]
         host_ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(host_ws, "ACTION_SUCCESS")
-        
-        host_ws.send_json({"action": "DEAL_CARDS"})
+
+        host_ws.send_json(
+            {"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": players[0]["player_id"]}}
+        )
         wait_for_message(host_ws, "ACTION_SUCCESS")
         
         hands = []
@@ -310,9 +415,10 @@ def test_ws_multiplayer_gameplay_6p():
             websockets[i].send_json({"action": "PLAY_CARD", "payload": {"suit": valid_card["suit"], "rank": valid_card["rank"]}})
             wait_for_message(websockets[i], "ACTION_SUCCESS")
             
-        host_ws.send_json({"action": "RESOLVE_TRICK"})
-        wait_for_message(host_ws, "ACTION_SUCCESS")
-        
+        for ws in websockets:
+            resolving = wait_for_game_phase(ws, GamePhase.TRICK_RESOLUTION)
+            assert len(resolving["payload"]["current_trick"]["played_cards"]) == 6
+
         for ws in websockets: 
             for _ in range(20):
                 msg = ws.receive_json()
@@ -331,8 +437,10 @@ def test_ws_multiplayer_gameplay_8p():
         host_ws = websockets[0]
         host_ws.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(host_ws, "ACTION_SUCCESS")
-        
-        host_ws.send_json({"action": "DEAL_CARDS"})
+
+        host_ws.send_json(
+            {"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": players[0]["player_id"]}}
+        )
         wait_for_message(host_ws, "ACTION_SUCCESS")
         
         for i, ws in enumerate(websockets):
@@ -355,9 +463,10 @@ def test_ws_private_state_isolation():
 
         ws1.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(ws1, "ACTION_SUCCESS")
-        ws1.send_json({"action": "DEAL_CARDS"})
+        ws1.send_json(
+            {"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": players[0]["player_id"]}}
+        )
         wait_for_message(ws1, "ACTION_SUCCESS")
-        
         s1 = wait_for_game_phase(ws1, GamePhase.PLAYING)
         s2 = wait_for_game_phase(ws2, GamePhase.PLAYING)
         
@@ -416,9 +525,10 @@ def test_ws_reconnect_during_game():
         
         ws1.send_json({"action": "START_GAME", "payload": {"hidden_trump_mode": False}})
         wait_for_message(ws1, "ACTION_SUCCESS")
-        ws1.send_json({"action": "DEAL_CARDS"})
+        ws1.send_json(
+            {"action": "SELECT_FIRST_PLAYER", "payload": {"player_id": players[0]["player_id"]}}
+        )
         wait_for_message(ws1, "ACTION_SUCCESS")
-        
         ws1.close()
         
         # P2 receives PLAYER_OFFLINE
@@ -466,3 +576,128 @@ def test_ws_error_contract():
         ws2.send_json({"action": "PLAY_CARD", "payload": {"suit": "HEARTS", "rank": 2}})
         err3 = wait_for_message(ws2, "ERROR")
         assert err3["payload"]["code"] == "INVALID_PHASE"
+
+
+# --- 11. SECURITY ERROR CODES ---
+
+def test_ws_select_trump_hider_rejected_in_normal_mode():
+    """SELECT_TRUMP_HIDER in normal trump mode returns INVALID_TRUMP_MODE."""
+    room_id, players = setup_room_with_players(4, trump_mode="normal")
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={p['session_token']}"
+                )
+            )
+            for p in players
+        ]
+        host_ws = websockets[0]
+
+        host_ws.send_json({"action": "START_GAME"})
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        host_ws.send_json({
+            "action": "SELECT_TRUMP_HIDER",
+            "payload": {"player_id": players[1]["player_id"]},
+        })
+        err = wait_for_message(host_ws, "ERROR")
+        assert err["payload"]["code"] == "INVALID_TRUMP_MODE"
+        assert err["payload"]["action"] == "SELECT_TRUMP_HIDER"
+
+
+@pytest.mark.parametrize("bad_index", [None, True, "0", 1.5])
+def test_ws_select_hidden_trump_rejects_malformed_card_index(bad_index):
+    """SELECT_HIDDEN_TRUMP with a non-integer card_index returns INVALID_CARD_INDEX."""
+    room_id, players = setup_room_with_players(4, trump_mode="hidden")
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={p['session_token']}"
+                )
+            )
+            for p in players
+        ]
+        host_ws = websockets[0]
+        hider_ws = websockets[1]
+
+        host_ws.send_json({"action": "START_GAME"})
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        host_ws.send_json({
+            "action": "SELECT_TRUMP_HIDER",
+            "payload": {"player_id": players[1]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        host_ws.send_json({
+            "action": "SELECT_FIRST_PLAYER",
+            "payload": {"player_id": players[0]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        wait_for_game_phase(hider_ws, GamePhase.HIDDEN_TRUMP_SELECTION)
+
+        hider_ws.send_json({
+            "action": "SELECT_HIDDEN_TRUMP",
+            "payload": {"card_index": bad_index},
+        })
+        err = wait_for_message(hider_ws, "ERROR")
+        assert err["payload"]["code"] == "INVALID_CARD_INDEX"
+        assert err["payload"]["action"] == "SELECT_HIDDEN_TRUMP"
+
+
+def test_ws_complete_trump_setup_rejected_for_non_hider():
+    """COMPLETE_TRUMP_SETUP by a non-hider returns NOT_TRUMP_HIDER."""
+    room_id, players = setup_room_with_players(4, trump_mode="hidden")
+
+    with ExitStack() as stack:
+        websockets = [
+            stack.enter_context(
+                client.websocket_connect(
+                    f"/ws/rooms/{room_id}?token={p['session_token']}"
+                )
+            )
+            for p in players
+        ]
+        host_ws = websockets[0]
+        hider_ws = websockets[1]
+        non_hider_ws = websockets[2]
+
+        host_ws.send_json({"action": "START_GAME"})
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        host_ws.send_json({
+            "action": "SELECT_TRUMP_HIDER",
+            "payload": {"player_id": players[1]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        host_ws.send_json({
+            "action": "SELECT_FIRST_PLAYER",
+            "payload": {"player_id": players[0]["player_id"]},
+        })
+        wait_for_message(host_ws, "ACTION_SUCCESS")
+
+        wait_for_game_phase(hider_ws, GamePhase.HIDDEN_TRUMP_SELECTION)
+
+        # Hider selects the card
+        hider_ws.send_json({
+            "action": "SELECT_HIDDEN_TRUMP",
+            "payload": {"card_index": 0},
+        })
+        wait_for_message(hider_ws, "ACTION_SUCCESS")
+        wait_for_game_phase(hider_ws, GamePhase.HIDDEN_TRUMP_REVEAL)
+
+        # Non-hider attempts to complete setup
+        non_hider_ws.send_json({"action": "COMPLETE_TRUMP_SETUP"})
+        err = wait_for_message(non_hider_ws, "ERROR")
+        assert err["payload"]["code"] == "NOT_TRUMP_HIDER"
+        assert err["payload"]["action"] == "COMPLETE_TRUMP_SETUP"
+
+        # Verify hider can still complete
+        hider_ws.send_json({"action": "COMPLETE_TRUMP_SETUP"})
+        wait_for_message(hider_ws, "ACTION_SUCCESS")
