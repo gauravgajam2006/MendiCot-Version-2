@@ -14,6 +14,7 @@ from mendicot.enums import GamePhase, Suit
 from mendicot.models import Card
 from mendicot.exceptions import (
     GameAlreadyStarted,
+    GameNotStarted,
     DealAlreadyCompleted,
     DealInvariantFailed,
     InvalidDeckDefinition,
@@ -21,6 +22,7 @@ from mendicot.exceptions import (
     InvalidPlayerCount,
     InvalidSeatArrangement,
     InvalidSeatConfiguration,
+    InvalidSession,
     InvalidTeam,
     InvalidTeamConfiguration,
     InvalidTeamName,
@@ -165,6 +167,7 @@ _ACTION_ERROR_CODES = {
     InvalidTeamName: "INVALID_TEAM_NAME",
     TeamNameTooLong: "TEAM_NAME_TOO_LONG",
     GameAlreadyStarted: "GAME_ALREADY_STARTED",
+    GameNotStarted: "GAME_NOT_STARTED",
     PlayerNotInRoom: "PLAYER_NOT_FOUND",
     InvalidPhase: "INVALID_PHASE",
     NotRoomHost: "HOST_ONLY",
@@ -175,6 +178,7 @@ _ACTION_ERROR_CODES = {
     InvalidTrumpMode: "INVALID_TRUMP_MODE",
     InvalidCardIndex: "INVALID_CARD_INDEX",
     NotTrumpHider: "NOT_TRUMP_HIDER",
+    InvalidSession: "INVALID_SESSION",
 }
 
 
@@ -231,6 +235,15 @@ async def _handle_failed_direct_send(room_id: str, player_id: str) -> None:
             room_id,
             {"type": "PLAYER_OFFLINE", "payload": {"player_id": player_id}},
         )
+
+
+def _session_token_matches_room(token: str, room_id: str, player_id: str) -> bool:
+    session = session_tokens.get(token)
+    return (
+        session is not None
+        and hmac.compare_digest(session["room_id"], normalize_room_id(room_id))
+        and hmac.compare_digest(session["player_id"], player_id)
+    )
 
 
 def _session_token_digest(token: str) -> str:
@@ -295,7 +308,11 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         room = room_manager.get_room(room_id)
     except MendiCotError:
         return False
-    if room.status not in (RoomStatus.WAITING, RoomStatus.GAME_SETUP) or player_id not in room.player_ids:
+    terminal_in_game = room.status == RoomStatus.IN_GAME and room.is_terminal()
+    if (
+        room.status not in (RoomStatus.WAITING, RoomStatus.GAME_SETUP)
+        and not terminal_in_game
+    ) or player_id not in room.player_ids:
         return False
     removing_host = room.host_id == player_id
     next_host_id = _next_host_id(room, player_id) if removing_host else None
@@ -304,6 +321,10 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         room.host_id = next_host_id
         if room.engine is not None:
             room.engine.state.host_id = next_host_id
+    if room.status == RoomStatus.WAITING:
+        # The removal completed the final all-returned transition; cancel only
+        # match lifecycle tasks. Disconnect-grace cleanup tasks are preserved.
+        _cancel_room_lifecycle(room_id)
     invalidate_player_tokens(room_id, player_id)
     if room.player_count == 0:
         _cancel_room_disconnect_cleanups(room_id)
@@ -480,6 +501,7 @@ def _enrich_game_view(room, view: dict) -> dict:
     view["host_id"] = room.host_id
     view["current_player_id"] = view.get("current_turn")
     view["team_names"] = room_state["team_names"]
+    view["returned_to_lobby_player_ids"] = room_state["returned_to_lobby_player_ids"]
     if room.status == RoomStatus.GAME_SETUP:
         view["players"] = room_state["players"]
     return view
@@ -540,6 +562,7 @@ def _schedule_trick_resolution(room_id: str) -> asyncio.Task | None:
 
     room.trick_resolution_generation += 1
     generation = room.trick_resolution_generation
+    match_generation = room.match_generation
     engine = room.engine
     expected_version = engine.state.version
 
@@ -556,6 +579,7 @@ def _schedule_trick_resolution(room_id: str) -> asyncio.Task | None:
             if (
                 current_room is not room
                 or current_room.engine is not engine
+                or current_room.match_generation != match_generation
                 or current_room.trick_resolution_generation != generation
                 or engine.state.version != expected_version
                 or engine.state.phase != GamePhase.TRICK_RESOLUTION
@@ -597,6 +621,7 @@ def _schedule_final_score_display(room_id: str) -> asyncio.Task | None:
     room.final_score_display_generation += 1
     generation = room.final_score_display_generation
     trick_generation = room.trick_resolution_generation
+    match_generation = room.match_generation
     engine = room.engine
     expected_version = engine.state.version
 
@@ -613,6 +638,7 @@ def _schedule_final_score_display(room_id: str) -> asyncio.Task | None:
             if (
                 current_room is not room
                 or current_room.engine is not engine
+                or current_room.match_generation != match_generation
                 or current_room.final_score_display_generation != generation
                 or current_room.trick_resolution_generation != trick_generation
                 or engine.state.version != expected_version
@@ -649,6 +675,7 @@ def _schedule_trump_reveal_display(room_id: str) -> asyncio.Task | None:
 
     room.trump_reveal_generation += 1
     generation = room.trump_reveal_generation
+    match_generation = room.match_generation
     engine = room.engine
     expected_version = engine.state.version
     reveal_generation = engine.state.reveal_generation
@@ -666,6 +693,7 @@ def _schedule_trump_reveal_display(room_id: str) -> asyncio.Task | None:
             if (
                 current_room is not room
                 or current_room.engine is not engine
+                or current_room.match_generation != match_generation
                 or current_room.trump_reveal_generation != generation
                 or engine.state.version != expected_version
                 or engine.state.reveal_generation != reveal_generation
@@ -702,6 +730,7 @@ def _schedule_hidden_card_return(room_id: str) -> asyncio.Task | None:
         return existing
 
     generation = room.trump_reveal_generation
+    match_generation = room.match_generation
     engine = room.engine
     expected_version = engine.state.version
     reveal_generation = engine.state.reveal_generation
@@ -719,6 +748,7 @@ def _schedule_hidden_card_return(room_id: str) -> asyncio.Task | None:
             if (
                 current_room is not room
                 or current_room.engine is not engine
+                or current_room.match_generation != match_generation
                 or current_room.trump_reveal_generation != generation
                 or engine.state.version != expected_version
                 or engine.state.reveal_generation != reveal_generation
@@ -870,9 +900,33 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     raise InvalidPhase(
                         "Tricks resolve automatically after the display window."
                     )
-                    
+
+                elif action == "RETURN_TO_LOBBY":
+                    if not _session_token_matches_room(token, room_id, player_id):
+                        raise InvalidSession(
+                            "Session token is no longer valid for this room."
+                        )
+                    try:
+                        was_reset = room.return_to_lobby(player_id)
+                    except PlayerNotInRoom as exc:
+                        await _send_action_error(
+                            room_id,
+                            player_id,
+                            action,
+                            "PLAYER_NOT_IN_ROOM",
+                            str(exc),
+                        )
+                        continue
+                    if was_reset:
+                        # Only the final all-returned transition cancels the
+                        # match lifecycle tasks. Partial returns keep the
+                        # terminal engine and its timers untouched.
+                        _cancel_room_lifecycle(room_id)
+
                 elif action == "LEAVE_ROOM":
-                    if room.status != RoomStatus.WAITING:
+                    if room.status != RoomStatus.WAITING and not (
+                        room.status == RoomStatus.IN_GAME and room.is_terminal()
+                    ):
                         raise MendiCotError(
                             "Cannot leave an active game; game players are preserved."
                         )
@@ -918,6 +972,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     "RENAME_TEAM",
                     "CANCEL_GAME_SETUP",
                     "SELECT_FIRST_PLAYER",
+                    "RETURN_TO_LOBBY",
                 ):
                     await _broadcast_room_state(room_id)
                 if room.status in (RoomStatus.GAME_SETUP, RoomStatus.IN_GAME):

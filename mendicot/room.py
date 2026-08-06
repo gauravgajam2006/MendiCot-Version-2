@@ -6,13 +6,14 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .engine import MendiCotEngine
-from .enums import TeamId
+from .enums import GamePhase, TeamId
 from .room_ids import normalize_room_id
 from .models import Player
 from .exceptions import (
     DuplicatePlayer,
     RoomFull,
     GameAlreadyStarted,
+    GameNotStarted,
     PlayerNotInRoom,
     InvalidRoomSize,
     InvalidPhase,
@@ -69,9 +70,15 @@ class GameRoom:
         self._status = RoomStatus.WAITING
         self.team_names: dict[TeamId, str] = dict(self.DEFAULT_TEAM_NAMES)
         self.engine: Optional[MendiCotEngine] = None
+        # Authoritative per-player post-game return state. Empty before and
+        # during an active match, populated only while the completed match is
+        # in a terminal GAME_OVER/DRAW phase, and cleared on final reset and
+        # on fresh match start. Never stored on a WebSocket connection.
+        self.returned_to_lobby_player_ids: set[str] = set()
         self.trick_resolution_generation = 0
         self.final_score_display_generation = 0
         self.trump_reveal_generation = 0
+        self.match_generation = 0
         self._setup_lock = threading.RLock()
 
     @property
@@ -85,6 +92,39 @@ class GameRoom:
     @property
     def status(self) -> RoomStatus:
         return self._status
+
+    def is_terminal(self) -> bool:
+        """True only while the completed match is in GAME_OVER or DRAW."""
+        return (
+            self.engine is not None
+            and self.engine.state.phase in (GamePhase.GAME_OVER, GamePhase.DRAW)
+        )
+
+    def _finalize_reset_locked(self) -> None:
+        """Reset a fully-returned completed match back to a fresh WAITING lobby."""
+        self.engine = None
+        self.match_generation += 1
+        self.returned_to_lobby_player_ids.clear()
+        self._status = RoomStatus.WAITING
+
+    def _evaluate_all_returned_locked(self) -> bool:
+        """Finalize the room to WAITING when every remaining member has returned.
+
+        Runs only while the room is in a terminal IN_GAME state and only when
+        players remain. An empty abandoned room is not converted into a reusable
+        WAITING room; the existing empty-room deletion lifecycle handles that.
+        """
+        if not self._players:
+            return False
+        if self._status != RoomStatus.IN_GAME or not self.is_terminal():
+            return False
+        if all(
+            player_id in self.returned_to_lobby_player_ids
+            for player_id in self.player_ids
+        ):
+            self._finalize_reset_locked()
+            return True
+        return False
 
     def _next_available_seat_index(self) -> int:
         occupied_seats = {player.seat_index for player in self._players}
@@ -148,10 +188,11 @@ class GameRoom:
         if player_id not in self.player_ids:
             raise PlayerNotInRoom(f"Player {player_id} not found in the room.")
         
-        if self._status == RoomStatus.IN_GAME:
+        if self._status == RoomStatus.IN_GAME and not self.is_terminal():
             raise GameAlreadyStarted("Cannot remove player after the game has started to preserve game state.")
 
         self._players = [p for p in self._players if p.player_id != player_id]
+        self.returned_to_lobby_player_ids.discard(player_id)
 
         # Transfer host if the host left
         if self.host_id == player_id:
@@ -159,6 +200,11 @@ class GameRoom:
                 self.host_id = self._players[0].player_id
             else:
                 self.host_id = None
+
+        # Every authoritative removal path re-evaluates the all-returned
+        # condition so the final transition is not specific to LEAVE_ROOM.
+        if self._players:
+            self._evaluate_all_returned_locked()
 
     def set_player_online(self, player_id: str, is_online: bool) -> None:
         self.get_player(player_id).is_online = is_online
@@ -316,6 +362,8 @@ class GameRoom:
         )
         self.engine = engine
         self.engine.begin_first_player_selection()
+        self.match_generation += 1
+        self.returned_to_lobby_player_ids.clear()
         self._status = RoomStatus.GAME_SETUP
 
     def cancel_game_setup(self, requester_id: str) -> None:
@@ -380,6 +428,37 @@ class GameRoom:
             raise
         self._status = RoomStatus.IN_GAME
 
+    def return_to_lobby(self, requester_id: str) -> bool:
+        """Mark the authenticated requester as returned to the post-game lobby.
+
+        Returns True only when this call completed the final all-returned
+        transition and reset the room to WAITING.
+        """
+        with self._setup_lock:
+            return self._return_to_lobby_locked(requester_id)
+
+    def _return_to_lobby_locked(self, requester_id: str) -> bool:
+        self.get_player(requester_id)
+
+        if self._status != RoomStatus.IN_GAME:
+            if self._status == RoomStatus.WAITING:
+                raise InvalidPhase("Room is already in the lobby.")
+            raise InvalidPhase("No completed match is active.")
+
+        if self.engine is None:
+            raise GameNotStarted()
+
+        if self.engine.state.phase not in (GamePhase.GAME_OVER, GamePhase.DRAW):
+            raise InvalidPhase(
+                "Match must be complete before returning to the lobby."
+            )
+
+        # Mark only the requester as returned. The terminal engine, final
+        # result, scores, and captured Mendis stay authoritative for every
+        # other player still viewing the result screen.
+        self.returned_to_lobby_player_ids.add(requester_id)
+        return self._evaluate_all_returned_locked()
+
     def get_state(self) -> dict:
         return {
             "room_id": self.room_id,
@@ -390,6 +469,13 @@ class GameRoom:
             "team_names": {
                 team_id.value: self.team_names[team_id] for team_id in TeamId
             },
+            "returned_to_lobby_player_ids": [
+                player.player_id
+                for player in sorted(
+                    self._players, key=lambda player: player.seat_index
+                )
+                if player.player_id in self.returned_to_lobby_player_ids
+            ],
             "players": [
                 {
                     "player_id": p.player_id,

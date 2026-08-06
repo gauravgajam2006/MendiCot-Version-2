@@ -139,3 +139,15 @@ class NotTrumpHider(MendiCotError):
     """Raised when a non-hider attempts a hider-only trump action."""
     def __init__(self, message="Only the selected trump hider can perform this action."):
         super().__init__(message)
+
+
+class GameNotStarted(MendiCotError):
+    """Raised when a room-level action requires an active match engine."""
+    def __init__(self, message="No active match engine."):
+        super().__init__(message)
+
+
+class InvalidSession(MendiCotError):
+    """Raised when a session token is no longer valid for its room."""
+    def __init__(self, message="Session token is no longer valid for this room."):
+        super().__init__(message)
