@@ -775,6 +775,14 @@ class MendiCotEngine:
         """Return a sanitized view of the game state safe for the given player."""
 
         state_dict = dataclasses.asdict(self.state)
+        # The client receives only its own cards, so publish the current size
+        # of every playable hand separately. This is deliberately derived
+        # from engine state (rather than the deal size or trick history): a
+        # hidden trump card is physically absent until it is returned.
+        state_dict["hand_counts"] = {
+            hand_player_id: len(hand)
+            for hand_player_id, hand in self.state.hands.items()
+        }
         state_dict["captured_mendis"] = {
             team_id: [
                 suit.value
