@@ -1,7 +1,23 @@
+import inspect
+
+import httpx
 import pytest
 from mendicot.secure_shuffle import DeterministicEntropySource
 from mendicot.models import Player
 from mendicot.engine import MendiCotEngine
+
+
+# Starlette 0.27 passes the ASGI app to HTTPX's former convenience argument.
+# Firebase Admin 7.5 requires HTTPX 0.28, which removed only that argument;
+# Starlette still supplies its own transport, so ignoring ``app`` restores the
+# original test-only behavior without changing application runtime code.
+if "app" not in inspect.signature(httpx.Client.__init__).parameters:
+    _httpx_client_init = httpx.Client.__init__
+
+    def _compatible_httpx_client_init(self, *args, app=None, **kwargs):
+        _httpx_client_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _compatible_httpx_client_init
 
 @pytest.fixture
 def entropy_source():

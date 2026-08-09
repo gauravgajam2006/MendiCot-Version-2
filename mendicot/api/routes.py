@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -42,6 +43,9 @@ from mendicot.exceptions import (
     NotTrumpHider,
 )
 from mendicot.room_ids import normalize_room_id
+from mendicot import firebase_push
+from mendicot.firebase_push import PushSendResult
+from mendicot.push_registrations import PushRegistrationStore
 
 from .connection_manager import ConnectionManager
 from .schemas import (
@@ -53,7 +57,13 @@ from .schemas import (
     ValidateSessionResponse,
 )
 
-app = FastAPI(title="MendiCot API")
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    firebase_push.initialize_firebase()
+    yield
+
+
+app = FastAPI(title="MendiCot API", lifespan=_app_lifespan)
 
 def _get_allowed_origins() -> list[str]:
     origins_env = os.getenv("ALLOWED_ORIGINS")
@@ -78,9 +88,20 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
+
+@app.get("/health/push")
+def push_health_check():
+    diagnostic = firebase_push.get_firebase_diagnostic()
+    return {
+        "status": diagnostic.state.value,
+        "credential_source": diagnostic.credential_source,
+    }
+
+
 # Global State
 room_manager = RoomManager()
 connection_manager = ConnectionManager()
+push_registrations = PushRegistrationStore()
 
 # session_token -> {"room_id": str, "player_id": str}
 session_tokens: Dict[str, Dict[str, str]] = {}
@@ -151,7 +172,12 @@ def _cancel_room_lifecycle(room_id: str, _room=None) -> None:
     _cancel_hidden_card_return(room_id)
 
 
-room_manager.on_room_deleted = _cancel_room_lifecycle
+def _cleanup_deleted_room(room_id: str, room=None) -> None:
+    _cancel_room_lifecycle(room_id, room)
+    push_registrations.remove_room(room_id)
+
+
+room_manager.on_room_deleted = _cleanup_deleted_room
 
 _ACTION_ERROR_CODES = {
     InvalidDeckDefinition: "INVALID_DECK_DEFINITION",
@@ -326,6 +352,7 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         # match lifecycle tasks. Disconnect-grace cleanup tasks are preserved.
         _cancel_room_lifecycle(room_id)
     invalidate_player_tokens(room_id, player_id)
+    push_registrations.remove_player(room_id, player_id)
     if room.player_count == 0:
         _cancel_room_disconnect_cleanups(room_id)
         invalidate_room_tokens(room_id)
@@ -769,6 +796,47 @@ def _schedule_hidden_card_return(room_id: str) -> asyncio.Task | None:
     return task
 
 
+def _development_test_push_enabled() -> bool:
+    environment = os.getenv("MENDICOT_ENV", "production").strip().lower()
+    enabled = os.getenv("MENDICOT_ENABLE_TEST_PUSH", "false").strip().lower()
+    return environment in {"development", "test"} and enabled in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _push_session_is_active(
+    room_id: str,
+    player_id: str,
+    token: str,
+    websocket: WebSocket,
+    room,
+) -> bool:
+    if not _session_token_matches_room(token, room_id, player_id):
+        return False
+    if connection_manager.get_connection(room_id, player_id) is not websocket:
+        return False
+    try:
+        current_room = room_manager.get_room(room_id)
+    except MendiCotError:
+        return False
+    return current_room is room and player_id in current_room.player_ids
+
+
+async def _send_private_action_success(
+    room_id: str, player_id: str, action: str, **safe_payload: object
+) -> None:
+    delivered = await connection_manager.send_to_player(
+        room_id,
+        player_id,
+        {
+            "type": "ACTION_SUCCESS",
+            "payload": {"action": action, **safe_payload},
+        },
+    )
+    if not delivered:
+        await _handle_failed_direct_send(room_id, player_id)
+
+
 @app.websocket("/ws/rooms/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
     room_id = normalize_room_id(room_id)
@@ -800,6 +868,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     await connection_manager.connect(room_id, player_id, websocket)
     room.set_player_online(player_id, True)
     _cancel_disconnect_cleanup(room_id, player_id)
+    push_registrations.touch_session(room_id, player_id, token)
 
     try:
         # 4 & 5. Handle initial state sync
@@ -839,7 +908,86 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             payload = data.get("payload", {})
             
             try:
-                if action == "START_GAME":
+                if action == "REGISTER_PUSH":
+                    if not _push_session_is_active(
+                        room_id, player_id, token, websocket, room
+                    ):
+                        raise InvalidSession(
+                            "Session token is no longer valid for this room."
+                        )
+                    if not isinstance(payload, dict) or set(payload) != {
+                        "registration_id", "enabled"
+                    }:
+                        raise ValueError(
+                            "REGISTER_PUSH requires registration_id and enabled only."
+                        )
+                    push_registrations.register(
+                        room_id, player_id, token,
+                        payload["registration_id"], payload["enabled"],
+                    )
+                    await _send_private_action_success(
+                        room_id, player_id, action, enabled=payload["enabled"]
+                    )
+                    continue
+
+                elif action == "UPDATE_PUSH_PREFERENCE":
+                    if not _push_session_is_active(
+                        room_id, player_id, token, websocket, room
+                    ):
+                        raise InvalidSession(
+                            "Session token is no longer valid for this room."
+                        )
+                    if not isinstance(payload, dict) or set(payload) != {"enabled"}:
+                        raise ValueError(
+                            "UPDATE_PUSH_PREFERENCE requires enabled only."
+                        )
+                    updated = push_registrations.update_preference(
+                        room_id, player_id, token, payload["enabled"]
+                    )
+                    await _send_private_action_success(
+                        room_id, player_id, action,
+                        enabled=payload["enabled"],
+                        status="updated" if updated else "no_registration",
+                    )
+                    continue
+
+                elif action == "TEST_PUSH_NOTIFICATION":
+                    if not _push_session_is_active(
+                        room_id, player_id, token, websocket, room
+                    ):
+                        raise InvalidSession(
+                            "Session token is no longer valid for this room."
+                        )
+                    if not isinstance(payload, dict) or payload:
+                        raise ValueError(
+                            "TEST_PUSH_NOTIFICATION does not accept a target payload."
+                        )
+                    if not _development_test_push_enabled():
+                        test_status = "unavailable"
+                    else:
+                        targets = push_registrations.enabled_targets(room_id, player_id)
+                        if not targets:
+                            test_status = "no_registration"
+                        else:
+                            results = await firebase_push.send_player_turn_notifications(
+                                targets,
+                                remove_invalid=push_registrations.remove_target,
+                            )
+                            if PushSendResult.SENT in results:
+                                test_status = "sent"
+                            elif results and all(
+                                result == PushSendResult.UNAVAILABLE
+                                for result in results
+                            ):
+                                test_status = "unavailable"
+                            else:
+                                test_status = "failed"
+                    await _send_private_action_success(
+                        room_id, player_id, action, status=test_status
+                    )
+                    continue
+
+                elif action == "START_GAME":
                     # The action envelope remains backward compatible, but the room
                     # configuration is the authoritative source for trump mode.
                     room.start_game(
