@@ -90,9 +90,23 @@ class PushRegistrationStore:
                 and (registration.enabled or not enabled_only)]
 
     def enabled_targets(self, room_id: str, player_id: str) -> list[str]:
+        return self.enabled_targets_for_sessions(room_id, player_id, None)
+
+    def enabled_targets_for_sessions(
+        self,
+        room_id: str,
+        player_id: str,
+        session_identities: set[str] | None,
+    ) -> list[str]:
+        """Return enabled targets restricted to current session identities."""
         targets: list[str] = []
         seen: set[str] = set()
         for registration in self.for_player(room_id, player_id, enabled_only=True):
+            if (
+                session_identities is not None
+                and registration.session_identity not in session_identities
+            ):
+                continue
             if registration.registration_id not in seen:
                 seen.add(registration.registration_id)
                 targets.append(registration.registration_id)

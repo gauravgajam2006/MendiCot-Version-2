@@ -79,7 +79,14 @@ class GameRoom:
         self.final_score_display_generation = 0
         self.trump_reveal_generation = 0
         self.match_generation = 0
+        # Incremented only when a new authoritative card-play turn begins.
+        # It intentionally survives Hidden Trump's optional reveal display.
+        self.turn_generation = 0
         self._setup_lock = threading.RLock()
+
+    def begin_playable_turn(self) -> None:
+        """Advance the authoritative identity of the current card-play turn."""
+        self.turn_generation += 1
 
     @property
     def player_ids(self) -> list[str]:

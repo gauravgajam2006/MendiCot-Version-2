@@ -45,7 +45,8 @@ from mendicot.exceptions import (
 from mendicot.room_ids import normalize_room_id
 from mendicot import firebase_push
 from mendicot.firebase_push import PushSendResult
-from mendicot.push_registrations import PushRegistrationStore
+from mendicot.push_registrations import PushRegistrationStore, session_identity
+from mendicot.turn_reminders import TurnReminderScheduler, TurnReminderState
 
 from .connection_manager import ConnectionManager
 from .schemas import (
@@ -60,7 +61,10 @@ from .schemas import (
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     firebase_push.initialize_firebase()
-    yield
+    try:
+        yield
+    finally:
+        await turn_reminder_scheduler.shutdown()
 
 
 app = FastAPI(title="MendiCot API", lifespan=_app_lifespan)
@@ -133,6 +137,77 @@ _trump_reveal_display_tasks: Dict[str, asyncio.Task] = {}
 _hidden_card_return_tasks: Dict[str, asyncio.Task] = {}
 
 
+def _get_turn_reminder_state(room_id: str) -> TurnReminderState | None:
+    """Return a delivery-ready snapshot of the current card-play turn."""
+    room_id = normalize_room_id(room_id)
+    try:
+        room = room_manager.get_room(room_id)
+    except RoomNotFound:
+        return None
+    engine = room.engine
+    if (
+        room.status != RoomStatus.IN_GAME
+        or engine is None
+        or engine.state.phase != GamePhase.PLAYING
+        or engine.state.current_turn is None
+        or engine.state.current_turn not in room.player_ids
+    ):
+        return None
+    player_id = engine.state.current_turn
+    active_session_identities = {
+        session_identity(token)
+        for token, session in session_tokens.items()
+        if session["room_id"] == room_id and session["player_id"] == player_id
+    }
+    if not active_session_identities:
+        return None
+    targets = tuple(
+        push_registrations.enabled_targets_for_sessions(
+            room_id, player_id, active_session_identities
+        )
+    )
+    if not targets:
+        return None
+    return TurnReminderState(
+        identity=(
+            room_id,
+            id(room),
+            room.match_generation,
+            id(engine),
+            room.turn_generation,
+            GamePhase.PLAYING.value,
+            player_id,
+        ),
+        player_id=player_id,
+        targets=targets,
+    )
+
+
+async def _send_scheduled_turn_notification(target: str) -> PushSendResult:
+    result = await firebase_push.send_turn_notification(target)
+    if result == PushSendResult.INVALID_REGISTRATION:
+        push_registrations.remove_target(target)
+    return result
+
+
+turn_reminder_scheduler = TurnReminderScheduler(
+    _get_turn_reminder_state, _send_scheduled_turn_notification
+)
+
+
+def _sync_turn_reminder(
+    room_id: str, *, fresh_grace_for: str | None = None
+) -> None:
+    """Synchronize the centralized scheduler after authoritative mutation."""
+    state = _get_turn_reminder_state(room_id)
+    turn_reminder_scheduler.sync_room(
+        normalize_room_id(room_id),
+        fresh_grace=(
+            state is not None and state.player_id == fresh_grace_for
+        ),
+    )
+
+
 def _cancel_trick_resolution(room_id: str) -> None:
     """Cancel and forget a room's pending delayed trick resolution."""
     room_id = normalize_room_id(room_id)
@@ -170,6 +245,7 @@ def _cancel_room_lifecycle(room_id: str, _room=None) -> None:
     _cancel_final_score_display(room_id)
     _cancel_trump_reveal_display(room_id)
     _cancel_hidden_card_return(room_id)
+    turn_reminder_scheduler.cancel_room(normalize_room_id(room_id))
 
 
 def _cleanup_deleted_room(room_id: str, room=None) -> None:
@@ -353,6 +429,8 @@ async def _remove_lobby_player(room_id: str, player_id: str) -> bool:
         _cancel_room_lifecycle(room_id)
     invalidate_player_tokens(room_id, player_id)
     push_registrations.remove_player(room_id, player_id)
+    turn_reminder_scheduler.cancel_player(room_id, player_id)
+    _sync_turn_reminder(room_id)
     if room.player_count == 0:
         _cancel_room_disconnect_cleanups(room_id)
         invalidate_room_tokens(room_id)
@@ -378,7 +456,15 @@ def _schedule_disconnect_cleanup(room_id: str, player_id: str) -> None:
                 return
             if connection_manager.get_connection(room_id, player_id) is not None:
                 return
-            await _remove_lobby_player(room_id, player_id)
+            removed = await _remove_lobby_player(room_id, player_id)
+            if not removed:
+                # Active matches intentionally preserve their authoritative
+                # player list. Once grace expires, however, the disconnected
+                # session is no longer reminder-eligible until it reconnects
+                # and registers again.
+                push_registrations.remove_player(room_id, player_id)
+                turn_reminder_scheduler.cancel_player(room_id, player_id)
+                _sync_turn_reminder(room_id)
         except asyncio.CancelledError:
             return
         finally:
@@ -614,6 +700,9 @@ def _schedule_trick_resolution(room_id: str) -> asyncio.Task | None:
                 return
 
             engine.resolve_trick()
+            if engine.state.phase == GamePhase.PLAYING:
+                room.begin_playable_turn()
+            _sync_turn_reminder(room_id)
             await _broadcast_game_states(room_id)
             if engine.state.phase == GamePhase.FINAL_SCORE_DISPLAY:
                 _schedule_final_score_display(room_id)
@@ -674,6 +763,7 @@ def _schedule_final_score_display(room_id: str) -> asyncio.Task | None:
                 return
 
             engine.finalize_game()
+            _sync_turn_reminder(room_id)
             await _broadcast_game_states(room_id)
         except asyncio.CancelledError:
             return
@@ -729,6 +819,7 @@ def _schedule_trump_reveal_display(room_id: str) -> asyncio.Task | None:
                 return
 
             engine.complete_trump_reveal_display()
+            _sync_turn_reminder(room_id)
             await _broadcast_game_states(room_id)
             _schedule_hidden_card_return(room_id)
         except asyncio.CancelledError:
@@ -784,6 +875,8 @@ def _schedule_hidden_card_return(room_id: str) -> asyncio.Task | None:
                 return
 
             engine.complete_hidden_card_return()
+            # This resumes the same card-play turn after the optional reveal.
+            _sync_turn_reminder(room_id)
             await _broadcast_game_states(room_id)
         except asyncio.CancelledError:
             return
@@ -869,6 +962,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
     room.set_player_online(player_id, True)
     _cancel_disconnect_cleanup(room_id, player_id)
     push_registrations.touch_session(room_id, player_id, token)
+    _sync_turn_reminder(room_id)
 
     try:
         # 4 & 5. Handle initial state sync
@@ -925,6 +1019,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         room_id, player_id, token,
                         payload["registration_id"], payload["enabled"],
                     )
+                    _sync_turn_reminder(room_id, fresh_grace_for=player_id)
                     await _send_private_action_success(
                         room_id, player_id, action, enabled=payload["enabled"]
                     )
@@ -943,6 +1038,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         )
                     updated = push_registrations.update_preference(
                         room_id, player_id, token, payload["enabled"]
+                    )
+                    _sync_turn_reminder(
+                        room_id,
+                        fresh_grace_for=player_id if updated else None,
                     )
                     await _send_private_action_success(
                         room_id, player_id, action,
@@ -1014,6 +1113,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 elif action == "SELECT_FIRST_PLAYER":
                     target_id = payload.get("player_id")
                     room.select_first_player(player_id, target_id)
+                    if (
+                        room.engine is not None
+                        and room.engine.state.phase == GamePhase.PLAYING
+                    ):
+                        room.begin_playable_turn()
 
                 elif action == "CANCEL_GAME_SETUP":
                     room.cancel_game_setup(player_id)
@@ -1031,6 +1135,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 elif action == "COMPLETE_TRUMP_SETUP":
                     if room.engine is None: raise MendiCotError("Game not started.")
                     room.engine.complete_hidden_trump_setup(player_id)
+                    room.begin_playable_turn()
                     
                 elif action == "PLAY_CARD":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -1039,6 +1144,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     suit = Suit(suit_str)
                     card = Card(suit=suit, rank=rank)
                     room.engine.play_card(player_id, card)
+                    if room.engine.state.phase == GamePhase.PLAYING:
+                        room.begin_playable_turn()
                     
                 elif action == "REVEAL_TRUMP":
                     if room.engine is None: raise MendiCotError("Game not started.")
@@ -1103,6 +1210,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                         f"Action {action} is unknown.",
                     )
                     continue
+
+                # Every successful lifecycle action converges through one
+                # authoritative scheduler synchronization point.
+                _sync_turn_reminder(room_id)
 
                 # Action succeeded
                 delivered = await connection_manager.send_to_player(
